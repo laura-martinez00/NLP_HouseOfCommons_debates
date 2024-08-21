@@ -1,0 +1,2751 @@
+---
+title: "NLP on the House of Commons Parliamentary Speeches"
+author: "Laura Martinez"
+date: "`r Sys.Date()`"
+output:
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = F, warning = F)
+```
+
+## Introduction and theoretical framework
+
+The United Kingdom's decision to leave the European Union, commonly referred to as Brexit, was one of the most significant political events in recent history. The debate over Brexit officially began with Prime Minister David Cameron's speech on January 23, 2013, where he proposed an in-out referendum on the UK's membership in the EU. This debate culminated in the referendum held on June 23, 2016, resulting in a vote to leave the EU. Understanding the sentiments and rhetoric used in parliamentary debates during this period can provide insights into the political and public sentiments that influenced the Brexit vote.
+
+## Motivation
+
+Sentiment analysis and natural language processing (NLP) are essential tools for analyzing large volumes of text, such as parliamentary debates. These methods can help identify the emotions and rhetorical strategies used by legislators, which can influence public opinion. Research by Osnabrügge et al. (2021) has shown that emotive rhetoric is particularly pronounced in high-profile legislative debates, such as Prime Minister’s Questions, and is used by legislators to appeal directly to voters. By applying sentiment analysis to the debates in the House of Commons, we can measure the sentiment towards Brexit and understand the emotional tone of the discussions.
+
+## Methodology
+
+#### Installing libraries
+
+```{r}
+library(conText)
+library(dplyr)
+library(readr)
+library(tidyr)
+library(lubridate)
+library(openxlsx)
+library(text2vec)
+library(data.table)
+library(stringr)
+library(tm)  
+library(readxl)
+library(ggplot2)
+library(ggimage)
+library(patchwork)
+library(magick)
+library(patchwork)
+library(cowplot)
+library(plotly)
+library(reticulate)
+library(tidytext)
+library(widyr)
+library(tibble)
+library(gt)
+library(broom)
+library(ggtext)
+library(sf)
+```
+
+```{r}
+# Read CSV and specify column types
+setwd("~/Desktop/Master/TFM/TFM_final")
+ParlVote_concat <- read_csv("ParlVote_concat.csv")
+
+```
+
+### Cleaning the data and renaming columns
+
+We automatically omitted non- speech elements included in the transcripts such as ‘[laugh- ter]’ and ‘rose—’ (they have been deleted and cleaned already for this dataset) - Talk about how the authors have pre-processed the data.
+
+Extract and create a date column:
+
+```{r}
+ParlVote_concat <- ParlVote_concat |>
+  # Convert the first 10 characters of debate_id to a Date object
+  mutate(date = as.Date(substr(debate_id, 1, 10)),
+         # Convert motion_speaker_id to numeric
+         motion_speaker_id = as.numeric(motion_speaker_id),
+         # Convert speaker_id to numeric
+         speaker_id = as.numeric(speaker_id)) |>
+  # Reorder columns, placing the date column first
+  select(date, everything())
+```
+
+Let´s get the data right for the MPs:
+
+-   Unite the names and surnames of the MPs
+
+-   Rename some columns
+
+```{r}
+# Define unite function |> 
+apply_unite <- function(df) {
+  df |>
+    unite("Full Name", "Last name", "First name", sep = ", ", remove = FALSE)
+}
+
+# Function to process each dataset separately
+processing <- function(df) {
+  df |> 
+    #previously defined function to unite names and surnames
+    apply_unite() |> 
+    #rename some columns
+    mutate(speaker_party = tolower(Party)) |> 
+    rename(speaker_id = `Person ID`, speaker_name = `Full Name`, 
+           speaker_constituency = Constituency) |> 
+    select(speaker_id, speaker_name, speaker_constituency)
+}
+```
+
+```{r}
+
+# Read all datasets and apply unite function using lapply
+mps_1997 <- processing(read_csv("mps (1997).csv"))#1 May 1997
+mps_2001 <- processing(read_csv("mps (2001).csv"))#7 Jun 2001
+mps_2005 <- processing(read_csv("mps (2005).csv"))#5 May 2005
+mps_2010 <- processing(read_csv("mps (2010).csv"))#6 May 2010
+mps_2015 <- processing(read_csv("mps (2015).csv"))#7 May 2015
+mps_2017 <- processing(read_csv("mps (2017).csv"))#8 June 2017
+mps_2019 <- processing(read_csv("mps (2019).csv"))#for posterior changes
+
+all_mps <- bind_rows(mps_1997, mps_2001, mps_2005, mps_2010, mps_2015, mps_2017, mps_2019)
+
+all_mps <- distinct(all_mps)
+
+```
+
+**Adding constituencies to each speaker:**
+
+-   First check duplicated values in the speaker_id column: this is because they could be duplicated in name but under a different constituency as constituencies change every once in a while.
+
+```{r}
+# Check all the speaker names with more than one ocurrence
+all_mps |> 
+    group_by(speaker_id) |> 
+    filter(n() > 1) |> 
+    ungroup()
+
+```
+
+Due to a change in the distribution of constituencies **there are 97 MPs duplicated**. We can fix this issue if we merge the constituencies by name and by date in case a MP has been elected in different years in different constituencies.
+
+Boundaries changed at some point between the 2005 elections to the 2010 elections. Thus for this analysis I will keep the later boundaries/district names (those of 2010)
+
+```{r}
+unique_speakers <- all_mps |> 
+  arrange(speaker_id) |> 
+  group_by(speaker_id) |> 
+  filter(row_number() == n())  # Keep only the last occurrence of each `speaker_id`
+
+#check if I only have unique values: 
+anyDuplicated(unique_speakers)
+```
+
+Now I have a clean list of all the MPs which I can merge to my data
+
+```{r}
+ParlVote_concat <- ParlVote_concat |>
+  # Join with the unique_speakers data frame based on speaker_id and speaker_name
+  left_join(unique_speakers, by = c("speaker_id", "speaker_name")) |>
+  # Move the speaker_constituency column to be right after speaker_name
+  relocate(speaker_constituency, .after = speaker_name)
+
+```
+
+Check NAs:
+
+```{r}
+# Assuming ParlVote_concat is your data frame
+na_indices <- is.na(ParlVote_concat$speaker_constituency)
+
+# Locate rows with NAs in `speaker_constituency`
+na_rows <- ParlVote_concat[na_indices, ]
+
+#check the names: 
+unique(na_rows$speaker_name)
+ 
+```
+
+There are 11 MPs not identified, let´s fix our data with information from the [internet](https://membersafter1832.historyofparliamentonline.org/members):
+
+```{r}
+# Define a list (dictionary) mapping (unmatched) speaker names to their constituencies
+speaker_to_constituency <- list(
+    "Devine, Jim" = "Livingston",
+    "Austin-Walker, John" = "Erith and Thamesmead",
+    "Mason, John" = "Glasgow Shettleston",
+    "Barclay, Stephen" = "North East Cambridgeshire",
+    "Jamieson, Cathy" = "Kilmarnock and Loudoun",
+    "McKenzie, Iain" = "Inverclyde",
+    "Sawford, Andy" = "Corby",
+    "Thornton, Mike" = "Eastleigh",
+    "Dhesi, Tanmanjeet Singh" = "Slough",
+    "Little Pengelly, Emma" = "Belfast South",
+    "Dodds, Jane" = "Brecon and Radnorshire"
+    # Add more speaker names and their constituencies as needed
+)
+
+# Fill in the missing values in `speaker_constituency` in `unique_speakers`
+for (i in seq_len(nrow(ParlVote_concat))) {
+    if (is.na(ParlVote_concat$speaker_constituency[i])) {
+        # Get the speaker's name
+        speaker_name <- ParlVote_concat$speaker_name[i]
+        
+        # Check if the speaker's name is in the reference list
+        if (speaker_name %in% names(speaker_to_constituency)) {
+            # Fill in the missing constituency
+            ParlVote_concat$speaker_constituency[i] <- speaker_to_constituency[[speaker_name]]
+        }
+    }
+}
+
+```
+
+Check NAs:
+
+```{r}
+sum(is.na(ParlVote_concat$speaker_constituency))
+```
+
+DO the same but with MOTION speakers
+
+```{r}
+unique_speakers <- unique_speakers |> 
+  rename( motion_speaker_id = speaker_id, motion_speaker_name = speaker_name, motion_speaker_constituency = speaker_constituency)
+```
+
+```{r}
+ParlVote_concat <- ParlVote_concat |> 
+  left_join(unique_speakers, by = c("motion_speaker_id", "motion_speaker_name")) |> 
+  relocate(motion_speaker_constituency, .after = motion_speaker_name)
+```
+
+```{r}
+# Assuming ParlVote_concat is your data frame
+na_indices <- is.na(ParlVote_concat$motion_speaker_constituency)
+
+# Locate rows with NAs in `speaker_constituency`
+na_rows <- ParlVote_concat[na_indices, ]
+
+#check the names: 
+unique(na_rows$motion_speaker_name)
+```
+
+Let´s fix the 3 missing ones:
+
+```{r}
+# Define a list (dictionary) mapping speaker names to their constituencies
+speaker_to_constituency <- list(
+    "Barclay, Stephen" = "North East Cambridgeshire",
+    "Jamieson, Cathy" = "Kilmarnock and Loudoun",
+    "Sawford, Andy" = "Corby"
+)
+
+# Fill in the missing values in `speaker_constituency` in `unique_speakers`
+for (i in seq_len(nrow(ParlVote_concat))) {
+    if (is.na(ParlVote_concat$motion_speaker_constituency[i])) {
+        # Get the speaker's name
+        motion_speaker_name <- ParlVote_concat$motion_speaker_name[i]
+        
+        # Check if the speaker's name is in the reference list
+        if (motion_speaker_name %in% names(speaker_to_constituency)) {
+            # Fill in the missing constituency
+            ParlVote_concat$motion_speaker_constituency[i] <- speaker_to_constituency[[motion_speaker_name]]
+        }
+    }
+}
+
+```
+
+**Finally**: check NAs, filter dates and drop useless variables:
+
+```{r}
+sum(is.na(ParlVote_concat$motion_speaker_constituency))
+
+ParlVote_concat <- ParlVote_concat |> 
+  #Drop useless variables
+  select(-debate_id, -motion_speaker_name) |> 
+  #Only interested in debates after 2013
+  filter(date >= as.Date("2013-01-01"))
+```
+
+Save dataset:
+
+```{r, eval=FALSE}
+write.csv(ParlVote_concat, "parliament_speeches.csv", row.names = FALSE)
+```
+
+```{r, eval=FALSE}
+write.xlsx(ParlVote_concat, "ParlVote_full.xlsx")
+
+```
+
+#### Assigning topics to each debate
+
+First I would like to see all of the debate titles we have in the dataset:
+
+```{r}
+topics <- ParlVote_concat|> 
+  distinct(debate_title, motion_text)
+
+nrow(topics)
+```
+
+Here we can see **there are 494 debates.**
+
+#### Cleaning the topics
+
+```{r}
+# Case-insensitive removal of "Orders of the Day — " from debate_title
+topics$debate_title <- gsub("Orders of the Day — ", "", topics$debate_title, ignore.case = TRUE)
+
+# Remove "Clause + number + —" patterns using regex
+topics$debate_title <- str_replace_all(topics$debate_title, "Clause\\s*[0-9]+\\s*—\\s*", "")
+
+# Remove occurrences of " — " from debate_title
+topics$debate_title <- str_replace_all(topics$debate_title, " — ", "")
+
+# Remove empty square brackets "[]"
+topics$debate_title <- gsub("\\[\\]", "", topics$debate_title)
+
+# Remove "Schedule + number + —" patterns using regex
+topics$debate_title <- str_replace_all(topics$debate_title, "Schedule\\s*[0-9]+\\s*—\\s*", "")
+
+# Case-insensitive removal of "Unallotted Half-Day"
+topics$debate_title <- gsub("Unallotted Half-Day", "", topics$debate_title, ignore.case = TRUE)
+
+# Remove patterns like "[1st Allotted Day]" using regex
+topics$debate_title <- gsub("\\[\\d{1,2}(?:st|nd|rd|th) Allotted Day\\]", " ", topics$debate_title)
+
+# Case-insensitive removal of "Un-allotted Half Day"
+topics$debate_title <- gsub("Un-allotted Half Day", "", topics$debate_title, ignore.case = TRUE)
+
+```
+
+Save the cleaned topics df as a csv in case we want to start from here.
+
+```{r}
+#Save the cleaned topics df as a csv
+write.csv(topics, "topics.csv", row.names = FALSE)
+
+```
+
+```{r}
+# Load necessary libraries
+library(dplyr)
+
+# Function to categorize each debate title based on keywords
+categorize_debate <- function(title, motion) {
+  title <- tolower(title)
+  motion <- tolower(motion)
+  
+  # Define category keywords
+  eu_keywords <- c('eu', 'european union', 'brexit', 'referendum', 'single market', 'remain', 'leave')
+  education_keywords <- c('education', 'school', 'university', 'exam', 'student', 'teacher', 'childcare', 'research')
+  energy_keywords <- c('energy', 'environment', 'climate', 'fuel', 'renewable', 'green', 'decarbonisation', 'methanol', 'turbine', 'wind')
+  welfare_keywords <- c('social security', 'welfare', 'benefit', 'pension', 'support', 'public service', 'community', 'local', 'council', 'faith', 'constituencies', 'marriage', 'partnership', 'administration', 'child','rehabilitation', 'hmrc', 'colleges', 'domestic' )
+  transport_keywords <- c('transport', 'rail', 'road', 'bus', 'train', 'whiplash')
+  health_keywords <- c('health', 'nhs', 'hospital', 'doctor', 'patient', 'medical', 'cannabis', 'dying', 'mesothelioma', 'drugs', 'abortion')
+  economy_keywords <- c('economy', 'finance', 'budget', 'economic', 'market', 'technology', 'innovation', 'tech', 'digital', 'internet', 'growth', 'infrastructure', 'anti-tax', 'tax', 'vat', 'financial', 'income', 'revenue', 'donations', 'expenditure', 'intellectual', 'taxation', 'bank', 'trade', 'consumer', 'ivory', 'customs', 'leverage', 'allowance', 'tfl')
+  housing_keywords <- c('housing', 'home', 'rent', 'landlord', 'tenant', 'dwelling', 'house', 'first-time')
+  legal_crime_keywords <- c('crime', 'unlawful', 'justice', 'police', 'criminal', 'court', 'equality', 'rights', 'defamation', 'dog', 'exemplary', 'injuries')
+  employment_keywords <- c('employment', 'job', 'work', 'worker', 'labor', 'enrolment', 'employee-ownership', 'self-employed', 'employment', 'employees', 'internships')
+  foreign_keywords <- c('foreign', 'international', 'diplomacy', 'relations', 'defense', 'military', 'army', 'navy', 'security', 'immigration', 'gibraltar', 'bulk', 'interception', 'safety', 'overseas', 'picketing', 'park', 'nca', 'slavery', 'entering')
+  
+
+  # Check for category keywords in title and motion and assign the topic
+  if (any(sapply(eu_keywords, grepl, title)) || any(sapply(eu_keywords, grepl, motion))) {
+    return('EU/Brexit')
+  } else if (any(sapply(education_keywords, grepl, title)) || any(sapply(education_keywords, grepl, motion))) {
+    return('Education')
+  } else if (any(sapply(energy_keywords, grepl, title)) || any(sapply(energy_keywords, grepl, motion))) {
+    return('Energy/Environment')
+  } else if (any(sapply(employment_keywords, grepl, title)) || any(sapply(employment_keywords, grepl, motion))) {
+    return('Employment')
+  } else if (any(sapply(welfare_keywords, grepl, title)) || any(sapply(welfare_keywords, grepl, motion))) {
+    return('Social Security/Society/Welfare')
+  } else if (any(sapply(transport_keywords, grepl, title)) || any(sapply(transport_keywords, grepl, motion))) {
+    return('Transport')
+  } else if (any(sapply(health_keywords, grepl, title)) || any(sapply(health_keywords, grepl, motion))) {
+    return('Health')
+  } else if (any(sapply(economy_keywords, grepl, title)) || any(sapply(economy_keywords, grepl, motion))) {
+    return('Economy/Technology')
+  } else if (any(sapply(housing_keywords, grepl, title)) || any(sapply(housing_keywords, grepl, motion))) {
+    return('Housing')
+  } else if (any(sapply(legal_crime_keywords, grepl, title)) || any(sapply(legal_crime_keywords, grepl, motion))) {
+    return('Crime/Law')
+  } else if (any(sapply(foreign_keywords, grepl, title)) || any(sapply(foreign_keywords, grepl, motion))) {
+    return('Defense/Foreign Affairs')
+  } else {
+    return('Parliamentary proceedings')
+  }
+}
+
+# Apply the categorization function to each row
+topics$category <- mapply(categorize_debate, topics$debate_title, topics$motion_text)
+
+# Display the distribution of categories
+table(topics$category)
+
+#drop obervations that have no category assigned (I have checked and it´s the one: "Clause 2  —  Meaning of consultant lobbying")
+topics <- topics |> 
+  filter(!is.na(category))
+```
+
+To later add the categories to our former dataset:
+
+-   We perform the same cleaning on the debate_title variable as in our former dataframe
+
+-   Merge the dataset by the now cleaned debate_title variable
+
+```{r}
+# Case-insensitive removal of "Orders of the Day — " from debate_title
+ParlVote_concat$debate_title <- gsub("Orders of the Day — ", "", ParlVote_concat$debate_title, ignore.case = TRUE)
+
+# Remove "Clause + number + —" patterns using regex
+ParlVote_concat$debate_title <- str_replace_all(ParlVote_concat$debate_title, "Clause\\s*[0-9]+\\s*—\\s*", "")
+
+# Remove occurrences of " — " from debate_title
+ParlVote_concat$debate_title <- str_replace_all(ParlVote_concat$debate_title, " — ", "")
+
+# Remove empty square brackets "[]"
+ParlVote_concat$debate_title <- gsub("\\[\\]", "", ParlVote_concat$debate_title)
+
+# Remove "Schedule + number + —" patterns using regex
+ParlVote_concat$debate_title <- str_replace_all(ParlVote_concat$debate_title, "Schedule\\s*[0-9]+\\s*—\\s*", "")
+
+# Case-insensitive removal of "Unallotted Half-Day"
+ParlVote_concat$debate_title <- gsub("Unallotted Half-Day", "", ParlVote_concat$debate_title, ignore.case = TRUE)
+
+# Remove patterns like "[1st Allotted Day]" using regex
+ParlVote_concat$debate_title <- gsub("\\[\\d{1,2}(?:st|nd|rd|th) Allotted Day\\]", " ", ParlVote_concat$debate_title)
+
+# Case-insensitive removal of "Un-allotted Half Day"
+ParlVote_concat$debate_title <- gsub("Un-allotted Half Day", "", ParlVote_concat$debate_title, ignore.case = TRUE)
+
+```
+
+Merge to our dataset into a dataframe that is ready to be used with Python for NLP:
+
+```{r}
+topics_unique <- topics |> 
+  distinct(debate_title, motion_text, .keep_all = TRUE)
+
+python_df <- ParlVote_concat |> 
+  left_join(topics_unique, by = c("debate_title", "motion_text")) |> 
+  relocate(category, .after = debate_title)
+
+```
+
+Carry out a final check and save the dataset:
+
+```{r}
+sum(is.na(python_df$category))
+# Write the updated dataframe to a new CSV file
+write.csv(python_df, 'python_df.csv', row.names = FALSE)
+```
+
+## **Speech sentiment analysis and Brexit vote**
+
+**Research question**: *Does the sentiment attached to a MP´s speech shape the opinions and vote of the people in its constituency (Brexit case)?*
+
+The objective is to perform a sentiment analysis on each of the interventions of each MP of each of the debates covered and to assign a column with a tag (positive/negative/neutral) and a score for such tag.
+
+I chose the regular Roberta by trying to input different speeches and realising that for regular topics the newest [RoBERTa](https://huggingface.co/cardiffnlp/twitter-roberta-base-sentiment-latest) model classified better such speeches than the [RoBERTa trained on political tweets](https://huggingface.co/cardiffnlp/xlm-twitter-politics-sentiment?text=A+mistaken+impression+has+been+created+in+this+debate+that+all+that+food+banks+do+is+distribute+emergency+food.+What+they+actually+do+is+give+financial+advice+and+debt+advice+to+people+who+have+got+into+difficult+situations%E2%80%94emergency+food+is+only+part+of+what+they+do):
+
+```{python, eval = FALSE}
+| eval = False
+# Installing Hugging Face Libraries
+!pip install --upgrade pip
+!pip install transformers 
+!pip install torch 
+!pip install pandas 
+!pip install tqdm 
+!pip install wordcloud
+!pip install seaborn
+!pip install plotly
+!pip install nltk
+!pip install datasets
+!pip install transformers[torch] accelerate -U
+```
+
+Import libraries and silence warnings
+
+```{python, eval = FALSE}
+| eval = False
+import torch
+import os
+import pandas as pd
+from transformers import AutoModelForSequenceClassification, AutoTokenizer, AutoConfig, Trainer, TrainingArguments
+import numpy as np
+from scipy.special import softmax
+from tqdm import tqdm  # For progress bar
+from sklearn.model_selection import train_test_split
+from datasets import Dataset
+
+import warnings
+warnings.filterwarnings('ignore')
+
+# Suppress the parallelism warning from tokenizers
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+```
+
+Tokenize and perform sentiment analysis on the speeches:
+
+```{python, eval = FALSE}
+| eval = False
+# Step 1: Load your dataset
+df = pd.read_csv("/Users/lauramartinez/Desktop/Master/TFM/python_df.csv")
+
+# Step 2: Define the preprocessing function
+def preprocess(text):
+    text = text.lower()  # Convert to lowercase
+    return text
+
+# Step 3: Load the model and tokenizer
+MODEL = "cardiffnlp/twitter-roberta-base-sentiment-latest"
+tokenizer = AutoTokenizer.from_pretrained(MODEL)
+config = AutoConfig.from_pretrained(MODEL)
+model = AutoModelForSequenceClassification.from_pretrained(MODEL)
+
+# Ensure model is using GPU if available
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model.to(device)
+
+# Step 4: Define a function to get the sentiment and score for a given text
+def get_sentiment_score(text):
+    text = preprocess(text)
+    # 'return_tensors' sets returned tokenized as PyTorch tensors
+    encoded_input = tokenizer(text, return_tensors='pt', truncation=True, max_length=512).to(device)
+    # Disable gradient calculation, as we're performing inference (not training)
+    with torch.no_grad():
+        # Pass the tokenized input through the model to get the output
+        output = model(**encoded_input)
+    # Extract the output logits (raw prediction scores) from the model output
+    scores = output[0][0].cpu().numpy()
+    # Apply the softmax function to convert logits to probabilities
+    scores = softmax(scores)
+    # Get the indices of the scores sorted in descending order
+    ranking = np.argsort(scores)[::-1]
+    # Map the highest scoring index to the corresponding sentiment label
+    sentiment = config.id2label[ranking[0]]
+    # Retrieve the highest score, which corresponds to the predicted sentiment
+    score = scores[ranking[0]]
+    # Return the predicted sentiment label and its corresponding score as a tuple
+    return sentiment, float(score)
+
+
+# Step 4b: Define a function to handle long texts by splitting into chunks
+def get_sentiment_score_for_long_text(text):
+    text = preprocess(text)
+    # Tokenize the preprocessed text into individual tokens
+    tokens = tokenizer.tokenize(text)
+    # Define the maximum size of each token chunk
+    chunk_size = 512
+    # Calculate the number of chunks needed to process the entire text
+    num_chunks = (len(tokens) + chunk_size - 1) // chunk_size
+
+    # Initialize an array to store cumulative sentiment scores for all chunks
+    all_scores = np.zeros(len(config.id2label))
+
+    # Loop through each chunk of tokens
+    for i in range(num_chunks):
+        # Extract the current chunk of tokens
+        chunk_tokens = tokens[i * chunk_size:(i + 1) * chunk_size]
+        # Convert the chunk of tokens back into a string
+        chunk_text = tokenizer.convert_tokens_to_string(chunk_tokens)
+        # Encode the chunked text into tensors suitable for the model
+        encoded_input = tokenizer(chunk_text, return_tensors='pt', truncation=True, max_length=chunk_size).to(device)
+        # Run the model on the encoded input without computing gradients (faster inference)
+        with torch.no_grad():
+            output = model(**encoded_input)
+      # Extract the output scores from the model and convert to a NumPy array
+        scores = output[0][0].cpu().numpy()
+        # Apply softmax to convert raw scores into probabilities
+        scores = softmax(scores)
+        # Accumulate the scores for each chunk
+        all_scores += scores
+
+    # Average the scores across all chunks to get final sentiment scores
+    all_scores /= num_chunks
+    # Get the index of the highest score (most likely sentiment label)
+    ranking = np.argsort(all_scores)[::-1]
+    # Retrieve the sentiment label corresponding to the highest score
+    sentiment = config.id2label[ranking[0]]
+    # Get the highest score itself (confidence level for the sentiment)
+    score = all_scores[ranking[0]]
+    # Return the predicted sentiment label and its confidence score
+    return sentiment, float(score)
+
+# Step 5: Tokenize all texts first to check their lengths
+token_lengths = df['speech'].apply(lambda x: len(tokenizer.tokenize(preprocess(x))))
+
+
+# Step 6: Apply the function to each row in the "speech" column
+sentiments = []
+scores = []
+
+import time
+start_time = time.time()
+
+# Iterate over each speech and its corresponding token length from the DataFrame
+for idx, (speech, length) in enumerate(zip(df['speech'], token_lengths)):
+    # If the speech is longer than 512 tokens, use function for long texts
+    if length > 512:
+        sentiment, score = get_sentiment_score_for_long_text(speech)
+    #If not, use the standard sentiment analysis function
+    else:
+        sentiment, score = get_sentiment_score(speech)
+    # Append the predicted sentiment to the sentiments list
+    sentiments.append(sentiment)
+    # Append the associated sentiment score to the scores list
+    scores.append(score)
+    
+    # Log progress every 100 rows
+    if (idx + 1) % 100 == 0:
+        elapsed_time = time.time() - start_time
+        print(f"Processed {idx + 1}/{len(df)} rows. Elapsed time: {elapsed_time:.2f} seconds.")
+
+
+# Step 7: Add the results to new columns
+df['sentiment'] = sentiments
+df['score'] = scores
+
+# Save the updated DataFrame to a new CSV file
+df.to_csv('/Users/lauramartinez/Desktop/Master/TFM/TFM_final/sentiment_python_df.csv', index=False)
+
+# Optional: Display the first few rows to verify
+print(df.head())
+```
+
+### R analysis
+
+Call the saved df in R:
+
+```{r}
+python_df <- read_csv('/Users/lauramartinez/Desktop/Master/TFM/TFM_final/sentiment_python_df.csv')
+```
+
+Add [Brexit results](https://commonslibrary.parliament.uk/brexit-votes-by-constituency/) to my df:
+
+```{r}
+referendum <- read_excel("eureferendum_constituency.xlsx")
+referendum <- referendum |> 
+  rename(speaker_constituency = Constituency) |> 
+  select(-`ONS ID`) |> 
+  mutate(brexit = ifelse(leave_perc > 0.5, 1, 0))
+```
+
+In order to perform sentiment analysis and extract conclusions it is best to select the variables that will be used for the analysis and create a separate dataframe:
+
+```{r}
+# Select variables
+brexit_df <- python_df |> 
+  select(date, category, speaker_constituency, party, speech, sentiment, score)
+
+# Add the referendum data
+brexit_df <- brexit_df |> 
+  inner_join(referendum, by = "speaker_constituency")
+
+# Ensure the date column is in Date format
+brexit_df$date <- as.Date(brexit_df$date)
+
+# Convert sentiment to a factor
+brexit_df$sentiment <- factor(brexit_df$sentiment)
+```
+
+After the dataframe is finally ready, we might be interested in exploring the sentiment distribution of the speeches:
+
+```{r}
+# Calculate relative frequencies
+brexit_df_relative <- brexit_df |> 
+  group_by(sentiment) |> 
+  summarise(count = n()) |> 
+  mutate(relative_count = count / sum(count))
+
+# Plot the relative distribution of sentiment
+ggplot(brexit_df_relative, aes(x = sentiment, y = relative_count, fill = sentiment)) + 
+  geom_bar(stat = "identity", color = "white") +
+  scale_fill_manual(values = c("neutral" = "cadetblue2", "positive" = "#76EE00", "negative" = "red2")) +
+  theme_minimal(base_size = 15) + # Increase base font size for readability
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5, size = 18), # Bold title, center, increase size
+    axis.title.x = element_text(face = "bold", size = 14), # Bold x-axis label
+    axis.title.y = element_text(face = "bold", size = 14), # Bold y-axis label
+    axis.text = element_text(size = 12), # Size for axis tick labels
+    legend.title = element_blank(), # Remove legend title for a cleaner look
+    legend.position = "top", # Position legend at the top
+    legend.text = element_text(size = 12) # Size for legend text
+  ) +
+  labs(
+    title = "Relative Distribution of Sentiment",
+    x = "Sentiment",
+    y = "Relative Frequency"
+  )
+
+```
+
+Distribution of sentiment through time
+
+```{r}
+
+# Calculate relative frequencies
+relative_sentiment <- brexit_df |> 
+  group_by(date, sentiment) |> 
+  summarise(count = n()) |> 
+  ungroup() |> 
+  group_by(date) |> 
+  mutate(relative_count = count / sum(count)) |> 
+  ungroup()
+
+# Plot the relative counts over time
+ggplot(relative_sentiment, aes(x = date, y = relative_count, fill = sentiment)) + 
+  geom_area(position = "fill", color = "white", alpha = 0.6) +  # Use geom_area for stacked plot
+  scale_fill_manual(values = c("neutral" = "cadetblue2", "positive" = "#76EE00", "negative" = "red2")) +
+  theme_minimal(base_size = 15) +  # Increase base font size for readability
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5, size = 18),  # Bold title, center, increase size
+    axis.title.x = element_text(face = "bold", size = 14),  # Bold x-axis label
+    axis.title.y = element_text(face = "bold", size = 14),  # Bold y-axis label
+    axis.text = element_text(size = 12),  # Size for axis tick labels
+    legend.title = element_blank(),  # Remove legend title for a cleaner look
+    legend.position = "top",  # Position legend at the top
+    legend.text = element_text(size = 12)  # Size for legend text
+  ) +
+  labs(
+    title = "Relative Distribution of Sentiment Over Time",
+    x = "Date",
+    y = "Relative Frequency"
+  )
+
+```
+
+#### Average sentiment per topic
+
+Once the categories for each speech have been created and their sentiment retrieved, let´s see which are the category average sentiment scores depending on whether the constituency voted Brexit or not. In this case no date filter is used because we are also interested in seeing the sentiment generated after the Brexit around each topic.
+
+```{r}
+# 1. Group by category and brexit, then compute the average sentiment score for each sentiment
+category_brexit_summary <- brexit_df |> 
+  group_by(category, brexit, sentiment) |> 
+  summarise(avg_score = mean(score, na.rm = TRUE), .groups = 'drop') |> 
+  ungroup()
+```
+
+Create a Brexit and No-Brexit profoile based on the topics created:
+
+```{r}
+# Filter for the sentiment with the highest avg_score for each category and brexit
+top_sentiment_summary <- category_brexit_summary |>
+  group_by(category, brexit) |>
+  filter(avg_score == max(avg_score)) |>
+  ungroup()
+```
+
+And visualize it:
+
+```{r}
+# Define colour palette
+sentiment_colors <- c("positive" = "chartreuse2", "neutral" = "cadetblue2", "negative" = "red2")
+
+# Create a bubble chart
+ggplot(top_sentiment_summary, aes(x = factor(brexit), y = reorder(category, avg_score), size = avg_score, color = sentiment)) +
+  geom_point(alpha = 0.7) +
+  scale_size_continuous(range = c(3, 15)) +  # Adjust the range to change bubble sizes
+  scale_x_discrete(labels = c("0" = "NO", "1" = "YES")) +  # Rename the X-Axis labels
+  scale_color_manual(values = sentiment_colors) +  # Apply the color palette
+  theme_minimal() +
+  labs(title = "Top Sentiment by Category and Brexit Status",
+       x = "Brexit Status",
+       y = "Category",
+       size = "Average Score",
+       color = "Sentiment") +
+  theme(axis.text.x = element_text(angle = 0, hjust = 0.5),
+        axis.title.y = element_blank(),
+        plot.title = element_text(size = 14, face = "bold"),
+        strip.text = element_text(size = 12))
+
+```
+
+#### Average sentiment per party
+
+Taking the last party in government before Brexit
+
+```{r}
+# Ensure party is a factor
+brexit_df$party <- as.factor(brexit_df$party)
+
+# Group by category and party, then compute the average sentiment score for each sentiment
+category_party_summary2 <- brexit_df |> 
+  filter(format(date, "%Y") == "2016") |> 
+  group_by(category, party, sentiment) |> 
+  summarise(avg_score = mean(score, na.rm = TRUE), .groups = 'drop') |> 
+  ungroup()
+
+# Filter for the sentiment with the highest avg_score for each category and party
+party_sentiment_summary <- category_party_summary2 |>
+  group_by(category, party) |>
+  filter(avg_score == max(avg_score)) |>
+  ungroup()
+```
+
+```{r}
+# Create a bubble chart
+ggplot(party_sentiment_summary, aes(x = party, y = reorder(category, avg_score), size = avg_score, color = sentiment)) +
+  geom_point(alpha = 0.7) +
+  scale_size_continuous(range = c(3, 15)) +  # Adjust the range to change bubble sizes
+  scale_color_manual(values = sentiment_colors) +  # Apply the color palette
+  theme_minimal() +
+  labs(title = "Top Sentiment by Category and Party",
+       x = "Party",
+       y = "Category",
+       size = "Average Score",
+       color = "Sentiment") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        axis.title.y = element_blank(),
+        plot.title = element_text(size = 14, face = "bold"),
+        strip.text = element_text(size = 12))
+
+
+```
+
+Merge datasets on category to include sentiments of Pro and Anti-Brexit profiles as a baseline for y-axis lines:
+
+```{r}
+# Merge datasets on category to include sentiments for y-axis lines
+merged_data <- party_sentiment_summary |>
+  left_join(top_sentiment_summary, by = "category", suffix = c("_party", "_axis"), relationship = "many-to-many")
+```
+
+Function to create plots with Y-coloured lines:
+
+```{r}
+# Create the plot for brexit = 0
+plot_brexit_0 <- ggplot(merged_data |> filter(brexit == 0), 
+                        aes(x = party, y = reorder(category, avg_score_party), size = avg_score_party, color = sentiment_party)) +
+  geom_point(alpha = 0.7) +
+  scale_size_continuous(range = c(3, 15)) +
+  scale_color_manual(values = sentiment_colors) +
+  theme_minimal() +
+  labs(title = "Top Sentiment by Category and Party (NO Brexit)",
+       x = "Party",
+       y = "Category",
+       size = "Average Score",
+       color = "Sentiment") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        axis.title.y = element_blank(),
+        plot.title = element_text(size = 14, face = "bold"),
+        strip.text = element_text(size = 12)) +
+  geom_hline(aes(yintercept = category, color = sentiment_axis), size = 0.2)
+
+# Create the plot for brexit = 1
+plot_brexit_1 <- ggplot(merged_data |> filter(brexit == 1), 
+                        aes(x = party, y = reorder(category, avg_score_party), size = avg_score_party, color = sentiment_party)) +
+  geom_point(alpha = 0.7) +
+  scale_size_continuous(range = c(3, 15)) +
+  scale_color_manual(values = sentiment_colors) +
+  theme_minimal() +
+  labs(title = "Top Sentiment by Category and Party (Brexit)",
+       x = "Party",
+       y = "Category",
+       size = "Average Score",
+       color = "Sentiment") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        axis.title.y = element_blank(),
+        plot.title = element_text(size = 14, face = "bold"),
+        strip.text = element_text(size = 12)) +
+  geom_hline(aes(yintercept = category, color = sentiment_axis), size = 0.2)
+
+# Print the plots
+print(plot_brexit_0)
+print(plot_brexit_1)
+```
+
+All results depend on whether I create the average score using previous data or just 2016 data
+
+#### Main party governing
+
+I need to first find the pictures of the logos:
+
+[SNP](https://www.facebook.com/theSNP/?locale=es_ES)
+
+[labour](https://onlineresize.club/2021-club.html)
+
+[conservative](https://respublicagame.fandom.com/wiki/Conservative_Party_(UK))
+
+[labourco-operative](https://www.castlepointlabour.org.uk/labour-co-operative/)
+
+[liberal-democrat](https://www.politics.co.uk/news/2011/09/19/lib-dems-have-best-party-logo/)
+
+[dup](https://en.wikipedia.org/wiki/Democratic_Unionist_Party)
+
+Now I will see which party was the one most frequently in power in those areas that voted for the Brexit vs in those that did not:
+
+```{r}
+# Group by brexit and determine the primary parties represented
+party_brexit_summary <- brexit_df |> 
+  filter(format(date, "%Y") == "2016") |> 
+  group_by(brexit, party) |> 
+  summarise(count = n(), .groups = 'drop') |> 
+  mutate(total = sum(count), relative_freq = count / total) |> 
+  arrange(brexit, desc(relative_freq)) |> 
+  group_by(brexit) |> 
+  slice_max(order_by = relative_freq, n = 5, with_ties = FALSE)
+
+```
+
+Add the dierctory in which I have the images I previously downloaded:
+
+```{r}
+logo_dir <- "~/Desktop/Master/TFM/TFM_final" # Change this to your working directory
+
+# Create a dataframe with the names of the parties and the corresponding paths to the logo files
+party_logos <- data.frame(
+  party = c("scottish-national-party", "labour", "conservative", "labourco-operative", "liberal-democrat", "dup"),
+  logo = file.path(logo_dir, c(
+    "scottish-national-party.png",
+    "labour.png",
+    "conservative.png",
+    "labourco-operative.png",
+    "liberal-democrat.png",
+    "dup.png"
+  ))
+)
+
+# Create a function to resize the images
+resize_image <- function(image_path, width = 120, height = 80) {
+  # Read the image from the specified file path
+  image <- image_read(image_path)
+  # Resize the image to the specified W & H, forcing the exact dimensions
+  image <- image_resize(image, paste0(width, "x", height, "!"))
+  # Create a temporary file with a .png extension to store the resized image
+  temp_file <- tempfile(fileext = ".png")
+  # Write the resized image to the temporary file in PNG format
+  image_write(image, path = temp_file, format = "png")
+  # Return the path to the temporary file containing the resized image
+  return(temp_file)
+}
+
+party_logos$logo <- sapply(party_logos$logo, resize_image)
+
+# Merge the logos df with party_brexit_summary
+party_brexit_summary_with_logos <- party_brexit_summary |>
+  left_join(party_logos, by = "party")
+```
+
+Prepare the data for the two different sides (pro-Brexit and anti-Brexit) and set a colour palette for the most common parties in the House of Commons:
+
+```{r}
+# Filter data for Brexit and No Brexit plots
+brexit_data <- party_brexit_summary_with_logos |> filter(brexit == 1)
+no_brexit_data <- party_brexit_summary_with_logos |> filter(brexit == 0)
+
+party_colors <- c(
+  "labour" = "red3",
+  "conservative" = "dodgerblue3",
+  "scottish-national-party" = "lemonchiffon",
+  "labourco-operative" = "darkmagenta",
+  "dup" = "darksalmon",
+  "liberal-democrat" = "goldenrod1"
+)
+
+```
+
+Plot the results
+
+```{r}
+# Determine the common y-axis limit
+y_max <- max(c(max(brexit_data$relative_freq+ 0.03), max(no_brexit_data$relative_freq)))
+
+# Create Brexit plot with fixed y-axis limits
+brexit_plot <- ggplot(brexit_data, aes(x = reorder(party, relative_freq), y = relative_freq, fill = party)) +
+  geom_bar(stat = "identity", position = "dodge", width = 0.7) +
+  geom_image(aes(image = logo, y = relative_freq + 0.015), position = position_dodge(width = 0.7), size = 0.1) +
+  scale_fill_manual(values = party_colors) +
+  theme_minimal() +
+  labs(
+    title = "",
+    x = "Brexit areas",
+    y = "Proportion of Electoral representation in Brexit districts"
+  ) +
+  theme(
+    axis.text.x = element_blank(),
+    axis.title.x = element_text(size = 12, face = "bold"), 
+    legend.position = "none",
+    panel.grid.major.x = element_blank(),
+    panel.grid.major.y = element_line(linetype = "dashed"), 
+    panel.grid.minor.y = element_line(linetype = "dashed")
+  ) +
+  ylim(0, y_max)
+
+# Create No Brexit plot with fixed y-axis limits
+no_brexit_plot <- ggplot(no_brexit_data, aes(x = reorder(party, relative_freq), y = relative_freq, fill = party)) +
+  geom_bar(stat = "identity", position = "dodge", width = 0.7) +
+  geom_image(aes(image = logo, y = relative_freq + 0.015), position = position_dodge(width = 0.7), size = 0.1) +
+  scale_fill_manual(values = party_colors) +
+  theme_minimal() +
+  labs(
+    title = "",
+    x = "No Brexit areas",
+    y = ""
+  ) +
+  theme(
+    axis.text.x = element_blank(),
+    axis.title.x = element_text(size = 12, face = "bold"), 
+    legend.position = "none",
+    panel.grid.major.x = element_blank(),
+    panel.grid.major.y = element_line(linetype = "dashed"), 
+    panel.grid.minor.y = element_line(linetype = "dashed")
+  ) +
+  ylim(0, y_max)
+
+# Manually create the legend
+legend_plot <- ggplot(data.frame(party = names(party_colors), count = rep(1, length(party_colors))), 
+                      aes(x = party, y = count, fill = party)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = party_colors) +
+  theme_void() +
+  theme(
+    legend.position = "right",
+    legend.title = element_text(size = 12, face = "bold"),
+    legend.text = element_text(size = 10)
+  ) +
+  guides(fill = guide_legend(title = "Party"))
+
+# Extract the legend as a separate plot
+legend <- ggplotGrob(legend_plot)$grobs[[which(sapply(ggplotGrob(legend_plot)$grobs, function(x) x$name) == "guide-box")]]
+
+# Combine the two plots with a common title
+combined_plot <- plot_grid(
+  brexit_plot, no_brexit_plot,
+  ncol = 2, rel_widths = c(1, 1)
+)
+
+# Add the common title and combine with the legend
+final_plot <- plot_grid(
+  ggdraw() +
+    draw_plot(combined_plot, 0.1, 0, 0.9, 0.9) +
+    draw_label("Top 5 Parties by Brexit Result in 2016", x = 0.6, y = 0.93, fontface = 'bold', size = 20),
+  legend,
+  ncol = 2,
+  rel_widths = c(0.85, 0.15)
+)
+
+# Display the final plot
+print(final_plot)
+
+```
+
+#### Correlation between the main party governing before Brexit and score on each of the topics
+
+I will create a score for each topic in terms of brexit or No brexit. Then see the impact of having one party governing in a constituency or another in showing a profile closer to the Brexit or No brexit status.
+
+Sentiment needs to be from 2013 to capture the ideas/c concepts of the parties regarding brexit but only the representation in 2016 (party in power in 2016) might have a correltion. This can be maybe because even the electoral win of those MPs in certain areas was forecoming the brexit results as well.
+
+First: Average sentiment per topic per party:
+
+```{r}
+
+# Calculate average sentiment per topic per party
+avg_sentiment <- brexit_df |> 
+  group_by(category, party, sentiment) |> 
+  summarize(avg_score = mean(score, na.rm = TRUE)) |> 
+  ungroup()
+
+# Select the sentiment with the highest score for each topic per party
+max_sentiment <- avg_sentiment |> 
+  group_by(category, party) |> 
+  filter(avg_score == max(avg_score)) |> 
+  ungroup() |> 
+  distinct(category, party, .keep_all = TRUE)
+
+```
+
+Filter for 2016 and Calculate Average Leave Percentage for each party based on brexit status
+
+```{r}
+# Filter for the year 2016 and select relevant columns
+df_2016 <- brexit_df |> 
+  filter(format(as.Date(date, format="%Y-%m-%d"), "%Y") == "2016") |> 
+  select(party, brexit, leave_perc)
+
+# Calculate the average leave percentage for each party based on Brexit status
+avg_leave_perc <- df_2016 |> 
+  group_by(party, brexit) |> 
+  summarize(avg_leave_perc = mean(leave_perc, na.rm = TRUE)) |> 
+  ungroup()
+
+
+```
+
+Merge data frames:
+
+```{r}
+# Merge the two data frames on the party column
+final_df <- left_join(max_sentiment, avg_leave_perc, by = "party", relationship = "many-to-many")
+
+# Display the resulting dataframe structure
+str(final_df)
+
+```
+
+Test the correlation/causation:
+
+**Let´s carry out a few ANOVA preliminary tests:**
+
+To see if there are any significant differences between between different parties in the average (leave) Brexit result:
+
+```{r}
+# Convert party to a factor
+final_df$party <- as.factor(final_df$party)
+
+# Perform ANOVA
+anova_party <- aov(avg_leave_perc ~ party, data = final_df)
+summary(anova_party)
+
+```
+
+And plot the results in a table:
+
+```{r}
+# Extract the ANOVA summary as a data frame
+anova_summary <- summary(anova_party)[[1]]
+
+# Convert the summary table into a data frame with meaningful row names
+anova_df <- data.frame(
+  Term = c("party", "Residuals"),
+  Df = anova_summary[, "Df"],
+  `Sum Sq` = round(anova_summary[, "Sum Sq"], 3), # Rounded for better display
+  `Mean Sq` = round(anova_summary[, "Mean Sq"], 5),
+  `F value` = round(anova_summary[, "F value"], 2),
+  `Pr(>F)` = format.pval(anova_summary[, "Pr(>F)"], digits = 3, eps = 0.001)
+)
+
+# Add significance codes manually
+anova_df$Signif <- c("***", "")
+
+# Create the table using gt
+anova_gt_table <- anova_df %>%
+  gt() %>%  # Convert the data frame into a gt table object
+  tab_header(
+    title = "ANOVA Summary Table"  # Add a title to the table
+  ) %>%
+  cols_label(
+    Term = "Term",  # Rename the 'Term' column
+    Df = "Degrees of Freedom",  # Rename the 'Df' column
+    Sum.Sq = "Sum of Squares",  # Correctly rename the 'Sum.Sq' column
+    Mean.Sq = "Mean Square",  # Correctly rename the 'Mean.Sq' column
+    F.value = "F Value",  # Correctly rename the 'F.value' column
+    Pr..F. = "p-value",  # Correctly rename the 'Pr..F.' column
+    Signif = "Signif. Codes"  # Rename the 'Signif' column
+  ) %>%
+  tab_style(
+    style = cell_text(weight = "bold"),  # Bold style for the column headers
+    locations = cells_column_labels(everything())  
+  ) %>%
+  tab_footnote(
+    # Add a footnote explaining significance codes
+    footnote = "Significance codes: *** p < 0.001",
+    # Place the footnote under the 'Signif. Codes' header
+    locations = cells_column_labels("Signif") 
+  )
+
+# Display the table
+anova_gt_table  # Render the gt table in the output
+
+```
+
+To determine if the sentiments expressed in speeches of each category by each party have a significant direct effect on the average leave percentage (i.e., testing for a triple interaction) we can do a multi-way ANOVA
+
+```{r}
+final_df$sentiment <- as.factor(final_df$sentiment)
+final_df$category <- as.factor(final_df$category)
+
+# Perform a multi-way ANOVA with triple interaction
+anova_multi <- aov(avg_leave_perc ~ party * sentiment * category, data = final_df)
+summary(anova_multi)
+
+```
+
+And plot the table:
+
+```{r}
+# Extract the ANOVA summary as a data frame
+anova_multi_summary <- summary(anova_multi)[[1]]
+
+# Convert the summary table into a data frame with meaningful row names
+anova_multi_df <- data.frame(
+  Term = rownames(anova_multi_summary),
+  Df = anova_multi_summary[, "Df"],
+  `Sum Sq` = round(anova_multi_summary[, "Sum Sq"], 3),  # Rounded for better display
+  `Mean Sq` = round(anova_multi_summary[, "Mean Sq"], 5),
+  `F value` = round(anova_multi_summary[, "F value"], 2),
+  `Pr(>F)` = format.pval(anova_multi_summary[, "Pr(>F)"], digits = 3, eps = 0.001)
+)
+
+# Add significance codes manually based on the results
+anova_multi_df$Signif <- c("***", "", "", "", "", "")
+
+# Create the table using gt
+anova_multi_gt_table <- anova_multi_df %>%
+  gt() %>%  # Convert the data frame into a gt table object
+  tab_header(
+    title = "Multi-Way ANOVA Summary Table"  # Add a title to the table
+  ) %>%
+  cols_label(
+    Term = "Term",  # Rename the 'Term' column
+    Df = "Degrees of Freedom",  # Rename the 'Df' column
+    Sum.Sq = "Sum of Squares",  # Correctly rename the 'Sum.Sq' column
+    Mean.Sq = "Mean Square",  # Correctly rename the 'Mean.Sq' column
+    F.value = "F Value",  # Correctly rename the 'F.value' column
+    Pr..F. = "p-value",  # Correctly rename the 'Pr..F.' column
+    Signif = "Signif. Codes"  # Rename the 'Signif' column
+  ) %>%
+  tab_style(
+    style = cell_text(weight = "bold"),  # Bold style for the column headers
+    locations = cells_column_labels(everything())  # Apply to all column headers
+  ) %>%
+  tab_footnote(
+    # Add a footnote explaining significance codes
+    footnote = "Significance codes: *** p < 0.001",  
+    # Place the footnote under the 'Signif. Codes' header
+    locations = cells_column_labels("Signif")  
+  )
+
+# Display the table
+anova_multi_gt_table  # Render the gt table in the output
+
+```
+
+The results indicate that while the party of the speaker significantly influences the average leave percentage, the combined effects of party, sentiment, and category do not have a significant impact. This suggests that the influence of sentiments expressed in speeches of each category by each party does not significantly vary the average leave percentage.
+
+Also I would like to look at this last relationship with further detail before jumping into a regression analysis. **Correlation Analysis for Each Type of Sentiment:**
+
+```{r}
+# Create a function to calculate correlation for each sentiment
+calculate_correlation <- function(df, sentiment_type) {
+  subset_df <- df |> filter(sentiment == sentiment_type)
+  cor(subset_df$avg_leave_perc, subset_df$avg_score, use = "complete.obs")
+}
+
+# Calculate correlation for each sentiment type
+sentiment_types <- levels(final_df$sentiment)
+correlations <- sapply(sentiment_types, function(sentiment) {
+  calculate_correlation(final_df, sentiment)
+})
+
+# Print correlations for each sentiment type
+names(correlations) <- sentiment_types
+print(correlations)
+
+```
+
+And plot this:
+
+```{r}
+# Convert the correlations to a data frame
+correlations_df <- data.frame(
+  sentiment = names(correlations),
+  correlation = correlations
+)
+
+# Create a dot plot
+ggplot(correlations_df, aes(x = sentiment, y = correlation, color = sentiment)) + 
+  geom_point(size = 5) +  # Create dots with a specified size
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray") +  # Add a dashed line at y = 0 for reference
+  theme_minimal(base_size = 15) +  # Minimal theme with increased base size
+  labs(
+    title = "Correlation Between Avg Leave % and Avg Score by Sentiment Type",
+    x = "Sentiment Type",
+    y = "Correlation"
+  ) +
+  geom_text(aes(label = round(correlation, 3)), vjust = -1, size = 5) +  # Add correlation values next to dots
+  scale_color_manual(values = c("negative" = "red3", "neutral" = "gray", "positive" = "springgreen")) + 
+  ylim(-0.35, 0.1) +  # Adjust y-axis limits to add space at the top
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5, size = 16),  # Bold, centered title
+    axis.title.x = element_text(face = "bold", size = 14),  # Bold x-axis label
+    axis.title.y = element_text(face = "bold", size = 14),  # Bold y-axis label
+    axis.text = element_text(size = 12),  # Size for axis tick labels
+    legend.position = "none",  # Remove legend
+    plot.margin = margin(t = 20, r = 20, b = 30, l = 20),  # Adjust plot margins to add space around the plot
+    axis.text.x = element_text(margin = margin(t = 10))  # Add space below the x-axis text labels
+  )
+
+```
+
+**Linear regression model:**
+
+```{r}
+# Remove rows with NA values before running regression
+final_df_complete <- final_df |> 
+  drop_na()
+
+# Relevel the party factor to set a different reference category *** CAREFUL = NAs!!!
+final_df$party <- relevel(final_df$party, ref = "ukip") #party that supported brexit the most
+
+# Fit a linear regression model
+model <- lm(avg_leave_perc ~ party + category*sentiment , data = final_df)
+summary(model)
+
+```
+
+Many of the interaction terms between `category` and `sentiment` are not significant, with p-values of 1.0000, indicating no effect on the outcome variable.
+
+Yet we might want to see some visualizations of the analysis:
+
+```{r}
+library(ggplot2)
+library(dplyr)
+
+# Filter significant coefficients (p < 0.05)
+significant_coefs <- broom::tidy(model) %>%
+  filter(p.value < 0.05)
+
+# Interaction plot between category and sentiment
+interaction_plot <- interaction.plot(
+  final_df$sentiment, final_df$category, final_df$avg_leave_perc,
+  col = c("red", "green", "blue"), legend = TRUE,
+  ylab = "Avg Leave %", xlab = "Sentiment",
+  trace.label = "Category"
+)
+
+# Coefficients plot: 
+# Tidy the model output
+tidy_model <- tidy(model, conf.int = TRUE)
+
+# Filter out the intercept for clarity and remove rows with missing estimates
+tidy_model <- tidy_model %>%
+  filter(term != "(Intercept)") %>%
+  filter(!is.na(estimate))
+
+# Highlight significant variables
+tidy_model <- tidy_model %>%
+  mutate(term_label = ifelse(p.value < 0.05, paste0("<b>", term, "</b>"), term))
+
+# Create the plot
+highlighted_plot <- ggplot(tidy_model, aes(x = reorder(term_label, estimate), y = estimate)) +
+  geom_point(aes(color = p.value < 0.05), size = 3) +  # Color points by significance
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.2) +
+  coord_flip() +  # Flip the coordinates for better readability
+  labs(
+    title = "Coefficient Plot of Linear Regression Model",
+    x = "Predictors",
+    y = "Coefficient Estimate",
+    color = "Significant (p < 0.05)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16),
+    axis.title = element_text(size = 14),
+    axis.text.y = element_markdown(size = 12),  # Use element_markdown to support HTML tags
+    axis.text.x = element_text(size = 12),
+    legend.title = element_text(size = 14),
+    legend.text = element_text(size = 12)
+  )
+
+print(highlighted_plot)
+
+# Residuals vs Fitted Plot
+plot(model, which = 1)  # This will give a residuals vs fitted plot
+
+# Q-Q Plot
+plot(model, which = 2)  # This will give a Q-Q plot
+
+# Cook's Distance Plot
+plot(model, which = 4)  # This will give a Cook's distance plot
+
+```
+
+The Green Party, Independent Party, Social Democratic and Labour Party, and UUP Party all have significant negative influences. Check party influence alone:
+
+```{r}
+model2 <- lm(avg_leave_perc ~ party, data = final_df)
+summary(model2)
+```
+
+11 missing values because the parties "alliance", "ukip", and "respect" did not participate in all debates regarding all the topics and thus some NAs are generated
+
+------------------------------------------------------------------------
+
+Table visualization for results: <https://r-graph-gallery.com/table.html>
+
+------------------------------------------------------------------------
+
+#### Sentiment evolution through time
+
+```{r}
+brexit_eu_brexit <- brexit_df |> 
+  mutate(date = as.Date(date)) |> 
+  filter(category == "EU/Brexit") |> 
+  group_by(date, sentiment) |> 
+  summarize(avg_score = mean(score, na.rm = TRUE), .groups = 'drop')
+
+```
+
+```{r}
+library(ggplot2)
+library(plotly)
+
+# Define custom colors
+line_colors <- c("negative" = "coral", "positive" = "darkolivegreen2", "neutral" = "darkslategray2")
+smooth_colors <- c("red3", "darkgreen", "deepskyblue3")
+
+# Ensure the date column is in Date format
+brexit_eu_brexit$date <- as.Date(brexit_eu_brexit$date)
+
+# Create the plot with geom_line
+plot <- ggplot(brexit_eu_brexit, aes(x = date, y = avg_score, group = sentiment)) +
+  geom_line(aes(color = sentiment), size = 0.5) +
+  scale_color_manual(values = line_colors, name = "Sentiment") +
+  labs(title = "Evolution of Average Sentiment Score for EU-Brexit",
+       x = "Date",
+       y = "Average Sentiment Score") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+    axis.title.x = element_text(size = 14),
+    axis.title.y = element_text(size = 14),
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 10)
+  ) +
+  scale_x_date(date_labels = "%Y", date_breaks = "1 year")
+
+# Add the geom_smooth layers separately with manual colors
+for (i in seq_along(smooth_colors)) {
+  sentiment_type <- unique(brexit_eu_brexit$sentiment)[i]
+  plot <- plot + 
+    geom_smooth(data = subset(brexit_eu_brexit, sentiment == sentiment_type), 
+                aes(x = date, y = avg_score), 
+                method = "loess", 
+                se = FALSE, 
+                linetype = "dashed", 
+                size = 1, 
+                color = smooth_colors[i])
+}
+
+# Add a vertical line for 23 June 2016
+plot <- plot + 
+  geom_vline(xintercept = as.Date("2016-06-23"), color = "red", size = 1, linetype = "solid")
+
+plot
+```
+
+We can also have in html an interactive version of the plot
+
+```{r, eval=FALSE}
+# Make the plot interactive
+interactive_plot <- ggplotly(plot)
+interactive_plot
+```
+
+## Topic modelling for EU/BREXIT topics
+
+#### IN CASE ANY PACKAGE DOES NOT LOAD CORRECTLY
+
+It might happen, especially if this code is being ran in a Mac computer that some packages such as BERTopic or UAMP do not work correctly as they should or do not load (specifically this might happen in the Topic Modelling section). If this is your case the you should set your own virtual environment through shell before running the following chunks. In order to do, you can follow this steps:
+
+1.  Restart your R session
+2.  Run the following code in your shell/terminal:
+
+```{bash, eval=FALSE}
+conda remove -n r-reticulate --all
+conda create -n r-reticulate python=3.9
+conda activate r-reticulate
+pip install bertopic sentence-transformers transformers torch
+```
+
+3.  Then run the following R chunk:
+
+```{r, eval=FALSE}
+# Set the Python environment to the newly created r-reticulate environment
+Sys.setenv(RETICULATE_PYTHON = "/opt/anaconda3/envs/r-reticulate/bin/python")
+
+library(reticulate)
+
+# Check if transformers and BERTopic can be imported without errors
+py_run_string("import transformers; from bertopic import BERTopic")
+```
+
+With this the packages issue should be fixed. As a recommendation right after this I would try to install and call all the python libraries of this notebook.
+
+### BERTopic: Running the HF model
+
+**Using BERTopic**: uses various embedding techniques and c-TF-IDF to create dense clusters allowing for easily interpretable topics.
+
+```{python, eval = FALSE}
+| eval = False
+!pip install --upgrade pip
+!pip install transformers datasets
+!pip install torch
+!pip install matplotlib
+!pip install umap-learn
+!pip install hdbscan
+!pip install nltk
+!pip install llvmlite 
+!pip install numba
+!pip install bertopic
+```
+
+```{python, eval = FALSE}
+| eval = False
+import re
+from nltk.corpus import stopwords
+from nltk.stem import WordNetLemmatizer
+import nltk
+import pandas as pd
+import numpy as np
+from transformers import AutoTokenizer, AutoModel
+import torch
+from bertopic import BERTopic
+from umap import UMAP
+from sklearn.feature_extraction.text import TfidfVectorizer
+import matplotlib.pyplot as plt
+from sklearn.cluster import KMeans
+import os
+import warnings
+import time
+
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+warnings.filterwarnings("ignore", message=".*beta.*")
+warnings.filterwarnings("ignore", message=".*gamma.*")
+
+```
+
+**Step 1: Prepare and preprocess the Text (Including Custom Stopwords and Lemmatization)**
+
+HF model used: [https://medium.com/\@okanyenigun/exploring-hugging-face-topic-modeling-7590efe7c3d3](https://medium.com/@okanyenigun/exploring-hugging-face-topic-modeling-7590efe7c3d3){.uri}
+
+First I would need to filter my dataset:
+
+```{python, eval = FALSE}
+| eval = False
+df = pd.read_csv("/Users/lauramartinez/Desktop/Master/TFM/TFM_final/sentiment_python_df.csv")
+df.info()
+```
+
+```{python, eval = FALSE}
+| eval = False
+# Fill NaN values in the 'category' column with an empty string
+df['category'] = df['category'].fillna('Parliamentary proceedings')
+
+# Now apply the .str.contains() method
+brexit_df = df[df['category'].str.contains('EU/Brexit')]
+brexit_df.info()
+```
+
+Now preprocess the text:
+
+```{python, eval = FALSE}
+| eval = False
+
+# Download necessary NLTK data
+nltk.download('stopwords')
+nltk.download('wordnet')
+
+# Initialize the lemmatizer
+lemmatizer = WordNetLemmatizer()
+
+# Define a function to preprocess the text
+def preprocess_text(text):
+    # List of words to remove
+    custom_stopwords = set(stopwords.words('english')) | {"hon", "people", "friend", "gentleman", "minister", "member", "house", "right", "does", "say", "want", "prime", "mr", "lord", "yes", "amendment", "uk", "eu", "parliament", "government", "vote", "country", "united", "kingdom", "need", "way", "agreement", "agree", "point", "make", "know", "debate", "think", "time", "business", "european", "referendum", "member", "year", "said", "voted", "claimed", "rid", "issue", "making", "going", "motion", "intervention", "thing", "today", "learned", "come", "place", "british", "level", "union", "party", "called", "talking", "like", "lady", "order", "day", "mp", "speaker", "itll", "able", "unionyes", "actually", "member", "gain", "conversation", "giving", "given" }
+    # Lowercase the text
+    text = text.lower()
+    # Remove punctuation and numbers
+    text = re.sub(r'[^\w\s\']', '', text)  # Remove punctuation but retain apostrophes
+    text = re.sub(r'\b\d+\b', '', text)  # Remove numbers
+    # Lemmatize and remove stopwords
+    cleaned_text = ' '.join([lemmatizer.lemmatize(word) for word in text.split() if word not in custom_stopwords])
+    return cleaned_text
+  
+# Apply the preprocessing function to the 'speech' column
+brexit_df['speech'] = brexit_df['speech'].apply(preprocess_text)
+
+```
+
+**Step 2: Use BERTopic for Topic Modeling**
+
+To improve the topic assignment and potentially split the large cluster into more meaningful topics, you can adjust the parameters of BERTopic. Specifically, you can change the `min_topic_size` parameter to control the minimum size of the topics and the `nr_topics` parameter to set the number of topics you desire.
+
+```{python, eval = FALSE}
+| eval = False
+
+# Initialize tokenizer and model from Hugging Face
+tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+model = AutoModel.from_pretrained("bert-base-uncased").to('cuda' if torch.cuda.is_available() else 'cpu')
+
+# Function to handle long texts by splitting into chunks and averaging their embeddings
+def embed_long_text(text, tokenizer, model, chunk_size=512):
+    text = preprocess_text(text)
+    tokens = tokenizer.tokenize(text)
+    if len(tokens) == 0:
+        return np.zeros((768,))  # Return a zero vector if there are no tokens
+
+    num_chunks = (len(tokens) + chunk_size - 1) // chunk_size
+    all_embeddings = []
+
+    for i in range(num_chunks):
+        chunk_tokens = tokens[i * chunk_size:(i + 1) * chunk_size]
+        chunk_text = tokenizer.convert_tokens_to_string(chunk_tokens)
+        encoded_input = tokenizer(chunk_text, return_tensors='pt', truncation=True, max_length=chunk_size).to('cuda' if torch.cuda.is_available() else 'cpu')
+
+        with torch.no_grad():
+            outputs = model(**encoded_input)
+
+        chunk_embedding = outputs.last_hidden_state.mean(dim=1).cpu().numpy()
+        if chunk_embedding.shape == (1, 768):  # Model output shape should be (1, 768)
+            all_embeddings.append(chunk_embedding[0])
+        else:
+            print(f"Unexpected shape {chunk_embedding.shape} for chunk {i} in text: {text[:30]}")
+
+    if all_embeddings:
+        return np.mean(all_embeddings, axis=0)
+    else:
+        return np.zeros((768,))  # Return a zero vector if no valid embeddings
+
+# Embedding speeches
+embeddings = []
+preprocessed_speeches = brexit_df['speech'].tolist()
+start_time = time.time()
+
+for idx, speech in enumerate(preprocessed_speeches):
+    embedding = embed_long_text(speech, tokenizer, model)
+    if embedding.shape == (768,):  # Ensure that the embedding has the correct shape
+        embeddings.append(embedding)
+    else:
+        print(f"Skipping speech {idx} due to incorrect embedding shape.")
+    # Log progress every 100 rows
+    if (idx + 1) % 100 == 0:
+        elapsed_time = time.time() - start_time
+        print(f"Processed {idx + 1}/{len(brexit_df)} rows. Elapsed time: {elapsed_time:.2f} seconds.")
+#If a warning on tokens length shows up stop the running and run this last chunk again
+
+# Convert list of embeddings to a numpy array
+embeddings = np.array(embeddings)
+assert embeddings.shape[1] == 768, f"Embeddings shape mismatch: {embeddings.shape[1]} != 768"
+
+# Adjust BERTopic parameters for better topic separation
+umap_model = UMAP(n_neighbors=15, n_components=2, metric='cosine', random_state=42)
+topic_model = BERTopic(umap_model=umap_model, verbose=True, min_topic_size=10, nr_topics=6)  # Set nr_topics to 6 to include 5 topics plus the outliers
+topics, probs = topic_model.fit_transform(preprocessed_speeches[:len(embeddings)], embeddings)
+
+# Verify the lengths
+print(f"Number of speeches processed: {len(preprocessed_speeches)}")
+print(f"Number of embeddings: {len(embeddings)}")
+print(f"Number of topics: {len(topics)}")
+
+# Add topics to the DataFrame
+brexit_df.loc[brexit_df.index[:len(topics)], 'topic'] = topics
+
+# Save the updated DataFrame to a new CSV file
+brexit_df.to_csv('/Users/lauramartinez/Desktop/Master/TFM/TFM_final/clustered_speech.csv', index=False)
+
+```
+
+Visualization:
+
+```{python, eval = FALSE}
+| eval = False
+
+# Reduce dimensions using UMAP for visualization
+reduced_embeddings = umap_model.fit_transform(embeddings)
+
+# Visualize the reduced embeddings with topic labels
+import matplotlib.pyplot as plt
+
+plt.figure(figsize=(10, 8))
+unique_topics = np.unique(topics)
+for topic in unique_topics:
+    idx = np.where(topics == topic)
+    plt.scatter(reduced_embeddings[idx, 0], reduced_embeddings[idx, 1], label=f"Topic {topic}")
+
+plt.legend()
+plt.title("Topic Visualization with UMAP")
+plt.xlabel("UMAP Dimension 1")
+plt.ylabel("UMAP Dimension 2")
+
+# Save the plot to an image file
+plt.savefig("topic_visualization_umap.png", dpi=300, bbox_inches='tight')  # Save as PNG with high resolution
+
+plt.show()
+```
+
+**Topic -1 (Noise):**
+
+-   BERTopic, by default, uses the HDBSCAN algorithm, which labels some points as noise (Topic -1) if they don't fit well into any cluster. This often accounts for one additional "topic" that represents outliers.
+
+**New Topic Assignments by BERTopic:**
+
+-   BERTopic identifies topics based on the embeddings and their distribution in the high-dimensional space. The topics identified by BERTopic do not necessarily match the topics in your original DataFrame, especially if there is a semantic or structural difference in how topics are represented in the embeddings.
+
+**Step 3: visualize topics**
+
+```{python, eval = FALSE}
+| eval = False
+def get_top_n_words(n, corpus, vectorizer):
+    if not corpus:
+        return []
+    vec = vectorizer.fit(corpus)
+    bag_of_words = vec.transform(corpus)
+    sum_words = bag_of_words.sum(axis=0)
+    words_freq = [(word, sum_words[0, idx]) for word, idx in vec.vocabulary_.items()]
+    words_freq = sorted(words_freq, key=lambda x: x[1], reverse=True)
+    return words_freq[:n]
+
+# Initialize the vectorizer
+vectorizer = TfidfVectorizer(stop_words='english')
+
+# Extract the top n words for each topic
+top_n_words_per_topic = []
+
+for topic in sorted(brexit_df['topic'].unique()):  # Get the number of unique topics
+    topic_speeches = brexit_df[brexit_df['topic'] == topic]['speech'].tolist()
+    if not topic_speeches:  # Check if the topic_speeches is empty
+        continue
+    top_words = get_top_n_words(20, topic_speeches, vectorizer)
+    if top_words:  # Check if top_words is not empty
+        top_n_words_per_topic.append((topic, top_words))
+
+# Debug: Print the topics and number of top words found
+for topic, words in top_n_words_per_topic:
+    print(f"Topic {topic}: {len(words)} top words")
+
+# Plotting the top words for each topic
+num_topics = len(top_n_words_per_topic)
+fig, axes = plt.subplots(2, 3, figsize=(15, 10), sharex=False)
+axes = axes.flatten()
+
+for i, (topic, top_words) in enumerate(top_n_words_per_topic):
+    words = [word for word, freq in top_words]
+    freqs = [freq for word, freq in top_words]
+    axes[i].barh(words, freqs, color='skyblue')
+    axes[i].set_title(f'Topic {topic}')
+    axes[i].invert_yaxis()
+
+# Turn off any remaining empty axes
+for ax in axes[num_topics:]:
+    ax.axis('off')
+
+plt.tight_layout()
+
+# Save the plot with a different name
+plt.savefig("top_words_per_topic.png", dpi=300, bbox_inches='tight')  # Save as PNG with high resolution
+
+plt.show()
+
+```
+
+Topic -1 and Topic 0 have fewer significant words compared to Topic 2 and Topic 3. This might be an indication of less coherence or fewer documents in those topics.
+
+### Alternative code:
+
+```{python, eval = FALSE}
+| eval = False
+import re
+from nltk.corpus import stopwords
+from nltk.stem import WordNetLemmatizer
+import nltk
+import warnings
+from scipy.sparse import SparseEfficiencyWarning
+
+
+# Reset the df we will work with
+brexit_df = df[df['category'].str.contains('EU/Brexit')]
+brexit_df.info()
+
+# Initialize the lemmatizer
+lemmatizer = WordNetLemmatizer()
+
+# Define a function to preprocess the text
+def preprocess_text(text):
+    # List of words to remove
+    custom_stopwords = set(stopwords.words('english')) | {"hon", "people", "friend", "gentleman", "minister", "member", "house", "right", "does", "say", "want", "prime", "mr", "lord", "yes", "amendment", "uk", "eu", "parliament", "government", "vote", "country", "united", "kingdom", "need", "way", "agreement", "agree", "point", "make", "know", "debate", "think", "time", "business", "european", "referendum", "member", "year", "said", "voted", "claimed", "rid", "issue", "making", "going", "motion", "intervention", "thing", "today", "learned", "come", "place", "british", "level", "union", "party", "called", "talking", "like", "lady", "order", "day", "mp", "speaker", "itll", "able", "unionyes", "actually", "member", "gain", "conversation", "giving", "given" }
+    # Lowercase the text
+    text = text.lower()
+    # Remove punctuation and numbers
+    text = re.sub(r'[^\w\s\']', '', text)  # Remove punctuation but retain apostrophes
+    text = re.sub(r'\b\d+\b', '', text)  # Remove numbers
+    # Lemmatize and remove stopwords
+    cleaned_text = ' '.join([lemmatizer.lemmatize(word) for word in text.split() if word not in custom_stopwords])
+    return cleaned_text
+  
+# Apply the preprocessing function to the 'speech' column
+brexit_df['speech'] = brexit_df['speech'].apply(preprocess_text)
+
+from sklearn.feature_extraction.text import TfidfVectorizer
+
+# Initialize TF-IDF Vectorizer
+vectorizer = TfidfVectorizer(stop_words='english', max_features=10000)
+warnings.simplefilter("ignore", SparseEfficiencyWarning)
+
+# Vectorize the preprocessed speech column
+tfidf_matrix = vectorizer.fit_transform(brexit_df['speech'])
+
+from sklearn.cluster import KMeans
+
+# Perform clustering
+kmeans = KMeans(n_clusters=6, random_state=0)
+labels = kmeans.fit_predict(tfidf_matrix)
+
+# Ensure the length of labels matches the original DataFrame
+assert len(labels) == len(brexit_df), "Length of labels does not match the length of the DataFrame."
+
+# Add topic labels to the DataFrame
+brexit_df['topic'] = labels
+
+# Save the updated DataFrame to a new CSV file
+brexit_df.to_csv('/Users/lauramartinez/Desktop/Master/TFM/TFM_final/clustered_speech2.csv', index=False)
+
+# Optional: Display the first few rows to verify
+print(brexit_df.head())
+
+
+import numpy as np
+from collections import Counter
+import matplotlib.pyplot as plt
+
+def get_top_n_words(n, corpus, vectorizer):
+    vec = vectorizer.fit(corpus)
+    bag_of_words = vec.transform(corpus)
+    sum_words = bag_of_words.sum(axis=0)
+    words_freq = [(word, sum_words[0, idx]) for word, idx in vec.vocabulary_.items()]
+    words_freq = sorted(words_freq, key=lambda x: x[1], reverse=True)
+    return words_freq[:n]
+
+vectorizer = TfidfVectorizer(stop_words='english')
+top_n_words_per_topic = []
+
+for topic in range(6):  # Changed to 6 clusters
+    topic_speeches = brexit_df[brexit_df['topic'] == topic]['speech']
+    top_words = get_top_n_words(20, topic_speeches, vectorizer)
+    top_n_words_per_topic.append(top_words)
+```
+
+```{python, eval = FALSE}
+| eval = False
+# Plotting
+fig, axes = plt.subplots(2, 3, figsize=(15, 10), sharex=True)  # Changed to 2 rows and 3 columns
+axes = axes.flatten()
+
+for i, ax in enumerate(axes):
+    top_words = top_n_words_per_topic[i]
+    words = [word for word, freq in top_words]
+    freqs = [freq for word, freq in top_words]
+    ax.barh(words, freqs)
+    ax.set_title(f'Topic {i}')
+    ax.invert_yaxis()
+
+plt.tight_layout()
+
+plt.savefig("top_words_per_topic_kmeans.png", dpi=300, bbox_inches='tight')  # Save as PNG with high resolution
+
+plt.show()
+
+```
+
+Compare both methods.
+
+#### \*\*Top party that starts motions related to brexit
+
+(I need to assign names to the topics created)
+
+```{r}
+clustered_speech <- read_csv("clustered_speech2.csv")
+
+top_parties <- clustered_speech %>%
+  group_by(topic, motion_party) %>%
+  summarise(motion_count = n(), .groups = 'drop') %>%
+  arrange(topic, desc(motion_count)) %>%
+  group_by(topic) %>%
+  slice_max(order_by = motion_count, n = 2)
+
+print(top_parties)
+
+```
+
+Now we plot it:
+
+```{r}
+# Create a named vector with the desired labels
+party_labels <- c("conservative" = "Conservative", 
+                  "labour" = "Labour", 
+                  "scottish-national-party" = "Scottish National Party")
+# Create the final plot
+ggplot(top_parties, aes(x = factor(topic), y = motion_party, size = motion_count)) +
+  geom_point(aes(fill = motion_party), shape = 21, color = "black", stroke = 1, alpha = 0.7) +
+  scale_size(range = c(5, 20)) +  # Adjust the bubble size
+  labs(
+    title = "Top Motion Parties by Topic",
+    x = "Topic",
+    y = "Motion Party",
+    size = "Motion Count", 
+    fill = "Motion Party"
+  ) +
+ scale_y_discrete(labels = party_labels) +  # Apply the custom labels
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 16, hjust = 0.5),  # Center and bold title
+    legend.position = "bottom",
+    legend.box = "horizontal",  # Arrange legends horizontally
+    legend.box.just = "left",  # Align legends to the left
+    axis.text.y = element_text(face = "bold", size = 12),  # Set y-axis text to bold
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  ) +
+  scale_fill_manual(values = c("conservative" = "dodgerblue3", 
+                                "labour" = "red3", 
+                                "scottish-national-party" = "lemonchiffon"))
+```
+
+### Types of Brexit - Most correlated words
+
+Hard Brexit, soft brexit, no-deal, remain
+
+```{r}
+#Restore your dataset for a new analysis
+brexit_topics <- read.csv('python_df.csv')
+brexit_topics <- brexit_topics |> 
+  select(date, party, category, speech) |> 
+  filter(category == "EU/Brexit")
+
+str(brexit_topics)
+```
+
+After the 2016 UK referendum, where the majority voted to leave the European Union, several potential Brexit scenarios were discussed:
+
+1.  **Hard Brexit**: This scenario involved the UK leaving the EU without any agreements in place, thus exiting both the single market and the customs union. This would mean relying on World Trade Organization (WTO) rules for trade, leading to significant regulatory divergence and potential economic disruptions​ ([World Economic Forum](https://www.weforum.org/agenda/2016/08/two-options-for-brexit-hard-or-soft/))​​ ([SPGlobal](https://www.spglobal.com/marketintelligence/en/mi/research-analysis/brexit-scenarios-for-the-uk-eu-and-global-trade-relations.html))​.
+
+2.  **Soft Brexit**: In a soft Brexit, the UK would leave the EU but retain close ties, such as remaining in the single market (similar to Norway) or the customs union (similar to Turkey). This would minimize trade barriers and maintain some regulatory alignment with the EU, reducing economic impact​ ([LSE Blogs](https://blogs.lse.ac.uk/europpblog/2016/06/09/scenarios-of-a-new-uk-eu-relationship-soft-brexit/))​​ ([World Economic Forum](https://www.weforum.org/agenda/2016/08/two-options-for-brexit-hard-or-soft/))​.
+
+3.  **Remain**: Although the referendum decided in favor of leaving, there were calls for a second referendum or parliamentary actions to reverse the decision, ultimately aiming to keep the UK within the EU​ ([LSE Blogs](https://blogs.lse.ac.uk/europpblog/2016/06/09/scenarios-of-a-new-uk-eu-relationship-soft-brexit/))​.
+
+4.  **Customs Union Only**: The UK could have left the EU but stayed in the customs union, allowing tariff-free trade for goods but not services. This would help avoid a hard border in Ireland but limit the UK's ability to forge independent trade agreements​ ([LSE Blogs](https://blogs.lse.ac.uk/europpblog/2016/06/09/scenarios-of-a-new-uk-eu-relationship-soft-brexit/))​​ ([SPGlobal](https://www.spglobal.com/marketintelligence/en/mi/research-analysis/brexit-scenarios-for-the-uk-eu-and-global-trade-relations.html))​.
+
+5.  **Bespoke Free Trade Agreement**: This would involve negotiating a unique, comprehensive free trade agreement tailored to the UK's needs. Such an agreement would likely be more complex and require extensive negotiations​ ([SPGlobal](https://www.spglobal.com/marketintelligence/en/mi/research-analysis/brexit-scenarios-for-the-uk-eu-and-global-trade-relations.html))​.
+
+6.  **No Deal Transition**: Leaving the EU without a withdrawal agreement but implementing a transitional arrangement to mitigate immediate disruptions and provide more time for future relationship negotiations​ ([SPGlobal](https://www.spglobal.com/marketintelligence/en/mi/research-analysis/brexit-scenarios-for-the-uk-eu-and-global-trade-relations.html))​.
+
+7.  **Second Referendum**: A call for another public vote on the final Brexit deal, which could result in either accepting the negotiated deal, opting for a different Brexit scenario, or remaining in the EU​ ([LSE Blogs](https://blogs.lse.ac.uk/europpblog/2016/06/09/scenarios-of-a-new-uk-eu-relationship-soft-brexit/))​.
+
+These scenarios reflected the broad spectrum of possibilities considered by policymakers, analysts, and the public as the UK navigated its exit from the EU. Ultimately, the UK pursued a form of Brexit that involved leaving the single market and customs union but with a negotiated trade deal in place.
+
+**Preprocess Text Data: create a single Corpus**
+
+```{r}
+# Load required packages
+library(dplyr)
+library(tidyr)
+library(tidytext)
+library(widyr)
+
+# Create your custom stopwords list
+custom_stopwords <- c(stopwords("en"), "hon", "people", "friend", "gentleman", 
+                      "minister", "member", "house", "right", "does", "say", 
+                      "want", "prime", "mr",  "yes", "amendment", "just",
+                      "absolutely", "kingdom", "need", "way",  "agree", "now",
+                      "point", "make", "know", "debate", "think", "members",
+                      "time", "business", "european", "member", "among",
+                      "year", "said", "many","day", "perhaps", "day",
+                      "voted", "claimed", "rid",  "making", "going", 
+                      "motion","thing", "today", "learned","come", "place", 
+                      "british", "level", "us", "one", "years", "uk",
+                      "called", "talking", "like", "lady", "order", "mp", "will")
+
+# Remove "no" from the custom stopwords list
+custom_stopwords <- setdiff(custom_stopwords, "no")
+
+# Verify that "no" has been removed
+"no" %in% custom_stopwords  # Should return FALSE
+
+```
+
+Now make a custom set of stopwords for each type of N-Gram
+
+**`as_tibble(..., .name_repair = "minimal")`**:
+
+-   This ensures that the tibble is created with the default column name `value`
+
+```{r}
+stopwords_unigram <- as_tibble(c(custom_stopwords, "eu", "union", "us", "one", "no", "can", "referendum", "many", "country", "leave", "brexit", "let", "much", "also", "even", "let", "made", "well", "get", "go", "must"), .name_repair = "minimal") %>%
+  rename(word = value)
+
+stopwords_bigram <- as_tibble(c(custom_stopwords, "eu", "us", "one", "members", "perhaps", "view", "minister's", "left", "white", "never", "now", "apart"), .name_repair = "minimal") %>%
+  rename(word = value)
+
+stopwords_trigram <- as_tibble(c(custom_stopwords, "no", "one", "protocol", "towards"), .name_repair = "minimal") %>%
+  rename(word = value)
+```
+
+Now we create dataframes with all the speeches tokenised in unigrams, bigrams and trigrams respectively. Then we filter them according to their frequency to have smaller dataframes.
+
+```{r}
+# Unigrams
+unigrams <- brexit_topics |> 
+  unnest_tokens(word, speech, drop = FALSE) |> 
+  anti_join(stopwords_unigram, by = "word")
+
+unigrams <- unigrams %>%
+  group_by(word) %>%
+  filter(n() >= 5) %>%
+  ungroup()
+
+# Bigrams
+bigrams <- brexit_topics |> 
+  unnest_tokens(bigram, speech, token = "ngrams", n = 2, drop = FALSE) |> 
+  separate(bigram, into = c("word1", "word2"), sep = " ") |>   # Separate bigrams 
+  filter(!word1 %in% stopwords_bigram$word & !word2 %in% stopwords_bigram$word) |> 
+  unite(bigram, word1, word2, sep = " ")
+
+bigrams <- bigrams |> 
+  group_by(bigram) |> 
+  filter(n() >= 4) |>   #adjust
+  ungroup()
+
+# Trigrams
+trigrams <- brexit_topics |> 
+  unnest_tokens(trigram, speech, token = "ngrams", n = 3, drop = FALSE) |> 
+  separate(trigram, into = c("word1", "word2", "word3"), sep = " ") |>  
+  filter(!word1 %in% stopwords_trigram$word & !word2 %in% stopwords_trigram$word & !word3 %in% stopwords_trigram$word) |> 
+  unite(trigram, word1, word2, word3, sep = " ")
+
+trigrams <- trigrams |> 
+  group_by(trigram) |> 
+  filter(n() >= 3) |>   
+  ungroup()
+
+# Term frequencies for unigrams
+unigram_freq <- unigrams |> 
+  count(word, sort = TRUE)
+
+# Term frequencies for bigrams
+bigram_freq <- bigrams |> 
+  count(bigram, sort = TRUE)
+
+# Term frequencies for trigrams
+trigram_freq <- trigrams |> 
+  count(trigram, sort = TRUE)
+  
+ 
+# Pairwise correlations for unigrams
+unigram_corr <- unigrams %>%
+  pairwise_cor(word, speech, sort = TRUE)
+
+# Pairwise correlations for bigrams
+bigram_corr <- bigrams |> 
+  pairwise_cor(bigram, speech, sort = TRUE)
+
+# Pairwise correlations for trigrams
+trigram_corr <- trigrams %>%
+  pairwise_cor(trigram, speech, sort = TRUE)
+
+
+target_ngrams <- c("no-deal brexit", "no deal brexit", "hard brexit", "customs union", 
+                   "free trade agreement", "no deal", "second referendum", "remain", 
+                   "soft brexit")
+
+# Function to get correlated words for given n-gram
+get_correlated_words <- function(corr_df, ngram) {
+  corr_df %>%
+    filter(item1 == ngram | item2 == ngram) %>%
+    arrange(desc(correlation))
+}
+
+# Get correlated words for each target n-gram
+correlated_words <- lapply(target_ngrams, function(ngram) {
+  unigram_res <- get_correlated_words(unigram_corr, ngram)
+  bigram_res <- get_correlated_words(bigram_corr, ngram)
+  trigram_res <- get_correlated_words(trigram_corr, ngram)
+  list(unigram = unigram_res, bigram = bigram_res, trigram = trigram_res)
+})
+
+names(correlated_words) <- target_ngrams
+```
+
+```{r}
+# Function to extract top N correlated words
+get_top_correlated_words <- function(corr_df, ngram, top_n = 30) {
+  corr_df %>%
+    filter(item1 == ngram | item2 == ngram) %>%
+    arrange(desc(correlation)) %>%
+    slice_head(n = top_n)
+}
+
+# Extract top correlated words for each target n-gram
+top_correlated_words <- lapply(target_ngrams, function(ngram) {
+  unigram_res <- get_top_correlated_words(unigram_corr, ngram)
+  bigram_res <- get_top_correlated_words(bigram_corr, ngram)
+  trigram_res <- get_top_correlated_words(trigram_corr, ngram)
+  
+  unigram_res$ngram_type <- "unigram"
+  bigram_res$ngram_type <- "bigram"
+  trigram_res$ngram_type <- "trigram"
+  
+  bind_rows(unigram_res, bigram_res, trigram_res) %>%
+    mutate(target_ngram = ngram)
+})
+
+top_correlated_words_df <- bind_rows(top_correlated_words)
+
+# Prepare data for plotting
+top_correlated_words_df <- top_correlated_words_df %>%
+  mutate(word = ifelse(item1 == target_ngram, item2, item1)) %>%
+  select(target_ngram, ngram_type, word, correlation) %>%
+  arrange(target_ngram, ngram_type, desc(correlation))
+
+
+```
+
+Now plot the results:
+
+```{r}
+ggplot(top_correlated_words_df, aes(x = reorder_within(word, correlation, target_ngram), y = correlation, fill = ngram_type)) +
+  geom_col(show.legend = FALSE, color = NA) + 
+  facet_wrap(~ target_ngram, scales = "free_y", nrow = 2, strip.position = "top") + 
+  coord_flip() +
+  scale_fill_brewer(palette = "Set1") + 
+  labs(
+    title = "Top Correlated Words for Each N-Gram",
+    subtitle = "A comparison of word associations across different n-grams",
+    x = "Words",
+    y = "Correlation"
+  ) +
+  scale_x_reordered() +  # This function correctly reorders within each facet
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 18, face = "bold"),
+    plot.subtitle = element_text(size = 14),
+    axis.text.y = element_text(size = 12),
+    strip.text = element_text(size = 12, face = "bold"),
+    panel.grid.major = element_line(color = "gray85"),
+    panel.grid.minor = element_blank()
+  )
+
+```
+
+#### N-gram frequency by party (Brexit outcomes)
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(ggimage)
+library(cowplot)
+
+# 1. Combine Unigrams, Bigrams, and Trigrams
+# Create/rename the ngram column for consistency
+
+bigrams <- bigrams %>% rename(ngram = bigram)
+trigrams <- trigrams %>% rename(ngram = trigram)
+
+# Adding a type column to identify n-gram types
+unigrams$type <- "unigram"
+bigrams$type <- "bigram"
+trigrams$type <- "trigram"
+
+# Combine all n-grams into a single data frame
+all_ngrams <- bind_rows(unigrams, bigrams, trigrams)
+
+# 2. Calculate Frequencies
+# Count frequencies of each n-gram by party
+ngram_party_freq <- all_ngrams %>%
+  filter(ngram %in% target_ngrams) %>%
+  count(party, ngram, sort = TRUE)
+
+# Calculate total occurrences of each n-gram across all parties
+total_ngram_freq <- ngram_party_freq %>%
+  group_by(ngram) %>%
+  summarise(total_n = sum(n))
+
+# 3. Calculate Relative Frequencies
+# Join the total frequencies with the party frequencies to get relative frequencies
+ngram_relative_freq <- ngram_party_freq %>%
+  inner_join(total_ngram_freq, by = "ngram") %>%
+  mutate(relative_freq = n / total_n)
+
+# 4. Merge with Party Logos
+# Assuming you have your `party_logos` data frame already set up with party names and logo paths
+ngram_relative_freq_with_logos <- ngram_relative_freq %>%
+  left_join(party_logos, by = "party")
+
+# 5. Find the Party with the Highest Relative Frequency for Each N-Gram
+top_party_for_ngram <- ngram_relative_freq_with_logos %>%
+  group_by(ngram) %>%
+  slice_max(relative_freq, with_ties = FALSE) %>%
+  ungroup()
+
+```
+
+```{r}
+# Define party colors with unused levels included
+party_colors <- c(
+  "labour" = "red3",
+  "conservative" = "dodgerblue3",
+  "scottish-national-party" = "lemonchiffon",
+  "labourco-operative" = "darkmagenta",
+  "dup" = "darksalmon",
+  "liberal-democrat" = "goldenrod1"
+)
+
+# Convert target_ngram to title case (capitalize first letters)
+top_party_for_ngram <- top_party_for_ngram %>%
+  mutate(ngram = str_to_title(ngram))
+
+# Plot the results
+plot <- ggplot(top_party_for_ngram, aes(x = reorder(ngram, -relative_freq), y = relative_freq, fill = party)) +
+  geom_col(width = 0.7) +
+  geom_image(aes(image = logo, y = relative_freq + 0.05), size = 0.11) +  # Adjust size and position as needed
+  scale_fill_manual(values = party_colors, drop = TRUE) +  # drop = TRUE removes unused levels from the legend
+  coord_flip() +
+  labs(
+    title = "Top Party by Relative Frequency of Each Target N-Gram",
+    x = "N-Grams",
+    y = "Relative Frequency",
+    fill = "Party"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 18, face = "bold"),
+    axis.text.y = element_text(size = 12, face = "bold"),
+    axis.title.y = element_text(size = 14),
+    axis.title.x = element_text(size = 14),
+    legend.position = "right",  # Adjust legend position as needed
+    panel.grid.major.x = element_blank(),
+    panel.grid.major.y = element_blank()
+  )
+
+# Display final plot
+print(plot)
+
+```
+
+#### Frequency of Brexit outcomes across time
+
+See which party uses each most
+
+```{r}
+# Convert date column to Date type
+brexit_topics <- brexit_topics |>  
+  mutate(date = ymd(date))
+str(brexit_topics)
+
+# Define the phrases to search for
+brexit_outcomes <- c("no-deal brexit", "no deal brexit", "hard brexit", "customs union", 
+                   "free trade agreement", "no deal", "second referendum", "remain", 
+                   "soft brexit")
+
+# Combine unigrams, bigrams, and trigrams into a single data frame
+combined_tokens <- bind_rows(
+  unigrams |> mutate(type = "unigram", outcome = unigrams$ngram),
+  bigrams  |> mutate(type = "bigram", outcome = bigrams$ngram),
+  trigrams |> mutate(type = "trigram", outcome = trigrams$ngram)
+)
+
+# Filter for the specific phrases and count their occurrences
+phrase_counts <- combined_tokens |> 
+  filter(outcome %in% brexit_outcomes) |> 
+  count(date, outcome, sort = TRUE) |> 
+  group_by(date, outcome) |> 
+  summarize(count = sum(n)) |> 
+  ungroup()
+
+
+
+# Plot the frequency of phrases over time
+phrase_counts |> 
+  ggplot(aes(x = date, y = count, color = outcome, group = outcome)) +  # Added group = phrase
+  geom_line() +
+  labs(title = "Frequency of Brexit-related Phrases Over Time",
+       x = "Date",
+       y = "Frequency",
+       color = "Phrase") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 70, hjust = 1))  # Rotate x-axis labels for better readability
+
+```
+
+### Hot topics
+
+Same analysis is done for certain hot topics.
+
+```{r}
+# Define the new target n-grams:
+new_target_ngrams <- c("single market", "customs union", "immigration", "sovereignty",
+                       "expensive", "migrant crisis", "populism", "nationalism", 
+                       "globalisation", "eurozone crisis")
+
+```
+
+```{r}
+# Get correlated words:
+new_correlated_words <- lapply(new_target_ngrams, function(ngram) {
+  unigram_res <- get_correlated_words(unigram_corr, ngram)
+  bigram_res <- get_correlated_words(bigram_corr, ngram)
+  trigram_res <- get_correlated_words(trigram_corr, ngram)
+  list(unigram = unigram_res, bigram = bigram_res, trigram = trigram_res)
+})
+
+names(new_correlated_words) <- new_target_ngrams
+
+```
+
+```{r}
+# Get top correlated words:
+new_top_correlated_words <- lapply(new_target_ngrams, function(ngram) {
+  unigram_res <- get_top_correlated_words(unigram_corr, ngram)
+  bigram_res <- get_top_correlated_words(bigram_corr, ngram)
+  trigram_res <- get_top_correlated_words(trigram_corr, ngram)
+  
+  unigram_res$ngram_type <- "unigram"
+  bigram_res$ngram_type <- "bigram"
+  trigram_res$ngram_type <- "trigram"
+  
+  bind_rows(unigram_res, bigram_res, trigram_res) |> 
+    mutate(target_ngram = ngram)
+})
+
+new_top_correlated_words_df <- bind_rows(new_top_correlated_words)
+
+```
+
+```{r}
+# Prepare and plot the results:
+new_top_correlated_words_df <- new_top_correlated_words_df %>%
+  mutate(word = ifelse(item1 == target_ngram, item2, item1)) %>%
+  select(target_ngram, ngram_type, word, correlation) %>%
+  arrange(target_ngram, ngram_type, desc(correlation))
+
+ggplot(new_top_correlated_words_df, aes(x = reorder_within(word, correlation, target_ngram), 
+                                        y = correlation, fill = ngram_type)) +
+  geom_col(show.legend = FALSE, color = NA) + 
+  facet_wrap(~ target_ngram, scales = "free_y", nrow = 2, strip.position = "top") + 
+  coord_flip() +
+  scale_fill_brewer(palette = "Set1") + 
+  labs(
+    title = "Top Correlated Words for New N-Grams",
+    subtitle = "A comparison of word associations across different n-grams",
+    x = "Words",
+    y = "Correlation"
+  ) +
+  scale_x_reordered() +  
+  theme_minimal() +
+  theme(
+    plot.title = element_text(size = 18, face = "bold"),
+    plot.subtitle = element_text(size = 14),
+    axis.text.y = element_text(size = 12),
+    strip.text = element_text(size = 12, face = "bold"),
+    panel.grid.major = element_line(color = "gray85"),
+    panel.grid.minor = element_blank()
+  )
+
+```
+
+#### Frequency of Hot topics across time
+
+See which party uses each most
+
+```{r}
+# Convert date column to Date type
+brexit_topics <- brexit_topics |>  
+  mutate(date = ymd(date))
+str(brexit_topics)
+
+# Define the phrases to search for
+phrases <- c("single market", "customs union", "immigration",
+             "sovereignty","expensive", "migrant crisis",
+             "populism", "nationalism", "globalisation", "eurozone crisis")
+
+# Combine unigrams, bigrams, and trigrams into a single data frame
+combined_tokens <- bind_rows(
+  unigrams |> mutate(type = "unigram", outcome = unigrams$ngram),
+  bigrams  |> mutate(type = "bigram", outcome = bigrams$ngram),
+  trigrams |> mutate(type = "trigram", outcome = trigrams$ngram)
+)
+
+# Filter for the specific phrases and count their occurrences
+phrase_counts <- combined_tokens |> 
+  filter(outcome %in% phrases) |> 
+  count(date, outcome, sort = TRUE) |> 
+  group_by(date, outcome) |> 
+  summarize(count = sum(n)) |> 
+  ungroup()
+
+
+# Plot the frequency of phrases over time
+phrase_counts |> 
+  ggplot(aes(x = date, y = count, color = outcome, group = outcome)) +  # Added group = phrase
+  geom_line() +
+  labs(title = "Frequency of Brexit-related Phrases Over Time",
+       x = "Date",
+       y = "Frequency",
+       color = "Phrase") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 70, hjust = 1))  # Rotate x-axis labels for better readability
+
+```
+
+## Hate speech with python
+
+[https://huggingface.co/unhcr/hatespeech-detection](https://huggingface.co/unhcr/hatespeech-detection?text=idiot){.uri}
+
+<https://huggingface.co/cardiffnlp/twitter-roberta-base-offensive> - few differences with this one. This later one even captures less instances of offensive speech than the unhcr model.
+
+First I will load the libraries.
+
+Then I hide my API Token in the project environment and load the .env document.
+
+```{python, eval = FALSE}
+| eval = False
+!pip install --upgrade pip
+!pip install python-dotenv
+from dotenv import load_dotenv
+from huggingface_hub import login
+
+# Load environment variables from the .env file
+load_dotenv()
+
+# Retrieve the Hugging Face API token from the environment variable
+token = os.getenv('HUGGINGFACE_TOKEN')
+token = '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'
+# Login to Hugging Face using your API token
+login(token=token)
+
+```
+
+```{python, eval = FALSE}
+| eval = False
+import pandas as pd
+import numpy as np
+import os
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from torch.nn.functional import softmax
+import torch
+from dotenv import load_dotenv
+from huggingface_hub import login
+import time
+
+# Disable parallelism warning
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+# Load the data
+df = pd.read_csv("/Users/lauramartinez/Desktop/Master/TFM/TFM_final/python_df.csv")
+
+```
+
+Now start tokenizing:
+
+```{python, eval = FALSE}
+| eval = False
+# Load the model and tokenizer
+model_name = "unhcr/hatespeech-detection"
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+model = AutoModelForSequenceClassification.from_pretrained(model_name)
+
+# Ensure model is using GPU if available
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model.to(device)
+```
+
+```{python, eval = FALSE}
+| eval = False
+# Define label mapping
+id2label = {0: "Normal", 1: "Offensive", 2: "Hate speech"}
+
+# Preprocessing function
+def preprocess(text):
+    return text.strip()
+
+# Step 4a: Define a function to get the hate speech label and score for a given text
+def get_hate_speech_score(text):
+    text = preprocess(text)
+    encoded_input = tokenizer(text, return_tensors='pt', truncation=True, max_length=512).to(device)
+    with torch.no_grad():
+        output = model(**encoded_input)
+    scores = output.logits[0].cpu().numpy()
+    scores = softmax(torch.tensor(scores), dim=0).numpy()
+    ranking = np.argsort(scores)[::-1]
+    label = id2label[ranking[0]]  
+    score = scores[ranking[0]]
+    return label, float(score)
+
+# Step 4b: Define a function to handle long texts by splitting into chunks
+def get_hate_speech_score_for_long_text(text):
+    text = preprocess(text)
+    tokens = tokenizer.tokenize(text)
+    chunk_size = 512
+    num_chunks = (len(tokens) + chunk_size - 1) // chunk_size
+
+    all_scores = np.zeros(len(id2label))
+
+    for i in range(num_chunks):
+        chunk_tokens = tokens[i * chunk_size:(i + 1) * chunk_size]
+        chunk_text = tokenizer.convert_tokens_to_string(chunk_tokens)
+        encoded_input = tokenizer(chunk_text, return_tensors='pt', truncation=True, max_length=chunk_size).to(device)
+        with torch.no_grad():
+            output = model(**encoded_input)
+        scores = output.logits[0].cpu().numpy()
+        scores = softmax(torch.tensor(scores), dim=0).numpy()
+        all_scores += scores
+
+    all_scores /= num_chunks
+    ranking = np.argsort(all_scores)[::-1]
+    label = id2label[ranking[0]]
+    score = all_scores[ranking[0]]
+    return label, float(score)
+
+# Tokenize all texts first to check their lengths
+token_lengths = df['speech'].apply(lambda x: len(tokenizer.tokenize(preprocess(x))))
+
+# Apply the function to each row in the "speech" column
+labels = []
+scores = []
+
+start_time = time.time()
+
+for idx, (speech, length) in enumerate(zip(df['speech'], token_lengths)):
+    if length > 512:
+        label, score = get_hate_speech_score_for_long_text(speech)
+    else:
+        label, score = get_hate_speech_score(speech)
+    labels.append(label)
+    scores.append(score)
+    
+    # Log progress every 100 rows
+    if (idx + 1) % 100 == 0:
+        elapsed_time = time.time() - start_time
+        print(f"Processed {idx + 1}/{len(df)} rows. Elapsed time: {elapsed_time:.2f} seconds.")
+
+# Add the results to new columns
+df['label'] = labels
+df['score'] = scores
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Plot the distribution of labels
+plt.figure(figsize=(8, 6))
+sns.countplot(x=df['label'])
+plt.title('Label Distribution')
+plt.xlabel('Label')
+plt.ylabel('Count')
+
+# Save the plot with a different name
+plt.savefig("labeled_speech.png", dpi=300, bbox_inches='tight')  # Save as PNG with high resolution
+
+plt.show()
+
+
+# Save the updated DataFrame to a new CSV file
+df.to_csv("/Users/lauramartinez/Desktop/Master/TFM/TFM_final/labeled_speech_df.csv", index=False)
+
+```
+
+```{r, eval=FALSE}
+#check if NAs have been created
+labeled_speech_df <- read_csv("labeled_speech_df.csv")
+str(labeled_speech_df)
+na_indices <- is.na(labeled_speech_df)
+labeled_speech_df[na_indices]
+```
+
+```{r}
+labeled_speech_df <- read_csv("labeled_speech_df.csv")
+# Distribution of labels check
+# Count the occurrences of each label
+label_counts <- labeled_speech_df %>%
+  group_by(label) %>%
+  summarize(count = n()) %>%
+  arrange(desc(count))
+
+# Print the counts
+print(label_counts)
+
+```
+
+#### Which party uses Hate speech the most?
+
+```{r}
+# Load necessary libraries
+library(dplyr)
+library(ggplot2)
+
+# Function to get top 5 parties by label with relative frequency
+get_top_parties_relative <- function(df, speech_label) {
+  df %>%
+    filter(label == speech_label) %>%
+    group_by(party) %>%
+    summarise(count = n()) %>%
+    mutate(relative_frequency = count / sum(count)) %>%
+    arrange(desc(count)) %>%
+    slice_head(n = 5) # Get top 5
+}
+
+# Get top 5 parties for Hate Speech
+top_hate_speech_parties <- get_top_parties_relative(labeled_speech_df, "Hate speech")
+top_hate_speech_parties
+
+# Get top 5 parties for Offensive Speech
+top_offensive_speech_parties <- get_top_parties_relative(labeled_speech_df, "Offensive")
+top_offensive_speech_parties
+
+```
+
+```{r}
+# Prepare data for Dumbbell Plot
+combined_data <- bind_rows(
+  top_hate_speech_parties %>% mutate(type = "Hate Speech"),
+  top_offensive_speech_parties %>% mutate(type = "Offensive")
+)
+
+# Dumbbell plot
+dumbbell_plot <- ggplot(combined_data, aes(x = relative_frequency, y = reorder(party, -relative_frequency), color = type)) +
+  geom_point(size = 7, shape = 21, fill = "white", stroke = 2) +  # Bigger dots with white fill and black outline
+  geom_line(aes(group = party), color = "grey50", linewidth = 1.2) +  # Use linewidth instead of size for lines
+  scale_color_manual(values = c("Hate Speech" = "red3", "Offensive" = "dodgerblue3")) +
+  geom_text(aes(label = round(relative_frequency, 2)), vjust = -1.5, size = 4.5, color = "black") +  # Position labels above dots
+  labs(title = "Comparison of Hate Speech and Offensive Speech by Party",
+       subtitle = "Top 5 parties with the highest relative frequency",
+       x = "Relative Frequency", y = "Party") +
+  theme_minimal(base_size = 15) +  # Increase base font size for readability
+  theme(
+    plot.title = element_text(face = "bold", size = 20, hjust = 0.5),  # Bold, centered title
+    plot.subtitle = element_text(size = 15, hjust = 0.5),  # Centered subtitle
+    axis.text.y = element_text(face = "bold"),  # Bold y-axis labels
+    axis.title.x = element_text(margin = margin(t = 10)),  # Add margin to x-axis title
+    legend.position = "top",  # Move legend to the top
+    legend.key = element_blank(),  # Remove default shapes in legend
+    legend.text = element_text(size = 12),
+    legend.title = element_text(size = 14),
+    panel.grid.major = element_line(color = "grey80"),  # Add major grid lines
+    panel.grid.minor = element_blank()  # Remove minor grid lines
+  ) +
+  guides(color = guide_legend(title = "Type of Speech", override.aes = list(shape = 21, size = 6)))  # Customize legend keys
+
+print(dumbbell_plot)
+
+```
+
+#### Is it something demographic?
+
+(We don´t have enough points classified)
+
+```{r}
+# Ensure constituency names match between dataframes (consider using string manipulation to match them)
+labeled_speech_df <- labeled_speech_df %>%
+  mutate(speaker_constituency = tolower(speaker_constituency))
+
+library(sf)
+shapefile_data <- st_read("uk_constituencies_2016.shp")
+shapefile_data <- shapefile_data %>%
+  mutate(area_name = tolower(area_name))
+
+joined_data <- labeled_speech_df %>%
+  inner_join(shapefile_data, by = c("speaker_constituency" = "area_name"))
+
+# Create a new label
+joined_data <- joined_data %>%
+  mutate(label_combined = case_when(
+    label == "Hate speech" & label == "Offensive" ~ "Both",  # This condition needs to be logically correct
+    label == "Hate speech" ~ "Hate speech",
+    label == "Offensive" ~ "Offensive",
+    TRUE ~ NA_character_
+  ))
+```
+
+```{r}
+# Custom color mapping
+speech_colors <- c("Hate speech" = "darkred", 
+                   "Offensive" = "gold", 
+                   "Both" = "orange")  # Add a color for both categories
+
+# Plotting the map with filled constituencies for Hate speech and Offensive speech
+ggplot() +
+  geom_sf(data = shapefile_data, fill = "white", color = "black") +  # Map outline
+  geom_sf(data = joined_data %>% filter(!is.na(label_combined)), 
+          aes(geometry = geometry, fill = label_combined), 
+          color = "black", size = 0.3, alpha = 0.7) +  # Filled constituencies with black borders
+  scale_fill_manual(values = speech_colors) +  # Custom fill colors
+  labs(title = "Constituencies with Hate and Offensive Speech",
+       fill = "Speech Type") +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",  # Move legend to bottom
+    legend.title = element_text(size = 12),  # Adjust legend title size
+    legend.text = element_text(size = 8),  # Adjust legend text size
+    legend.key.size = unit(0.5, "cm"),  # Adjust legend key size
+    legend.spacing.x = unit(0.5, "cm"),  # Adjust spacing between legend items
+    panel.grid.major = element_blank(),  # Remove major gridlines
+    panel.grid.minor = element_blank(),  # Remove minor gridlines
+    axis.title.x = element_blank(),  # Remove x-axis title
+    axis.title.y = element_blank(),  # Remove y-axis title
+    axis.text.x = element_blank(),   # Remove x-axis text
+    axis.text.y = element_blank(),   # Remove y-axis text
+    axis.ticks = element_blank(),    # Remove axis ticks
+    plot.margin = margin(10, 10, 10, 10),  # Reduce margin around the plot
+    plot.title = element_text(hjust = 0.5, size = 16, face = "bold")  # Center title, adjust size
+  ) +
+  coord_sf(expand = FALSE)  # Prevents unnecessary space around the map
+```
+
+#### Frequency of hate speech through time
+
+```{r}
+# Summarize the count of each label by date
+speech_summary <- labeled_speech_df %>%
+  group_by(date, label) %>%
+  summarize(count = n()) %>%
+  ungroup()
+
+ggplot(speech_summary, aes(x = date, y = count, color = label)) +
+  geom_line(size = 1) +
+  labs(title = "Trend of Hate Speech and Offensive Speech Over Time",
+       x = "Date",
+       y = "Count",
+       color = "Label") +
+  theme_minimal()
+
+```
+
+#### Most conflictive category
+
+```{r}
+hate_offensive_categories <- labeled_speech_df %>%
+  filter(label %in% c("Hate speech", "Offensive")) %>%
+  select(category, label, speech) |> 
+  print(n=45)
+
+```
+
+```{r}
+# Step 1: Calculate the frequency and relative frequency for each category
+category_freq <- hate_offensive_categories %>%
+  group_by(category) %>%
+  summarise(count = n()) %>%
+  mutate(relative_frequency = count / sum(count)) %>%
+  arrange(desc(relative_frequency))
+
+# Step 2: Identify the top 3 categories
+top_categories <- category_freq %>%
+  slice_max(relative_frequency, n = 3)
+
+# Step 3: Define a custom color palette with stronger colors
+strong_colors <- c("brown3", "blue4", "gold2")  # Vibrant colors
+
+# Step 4: Plot the top 3 categories
+ggplot(top_categories, aes(x = reorder(category, -relative_frequency), y = relative_frequency, fill = category)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(label = scales::percent(relative_frequency, accuracy = 0.1)), 
+            vjust = -0.5, size = 5) +
+  labs(title = "Top 3 Categories by Relative Frequency of Hate and Offensive Speech",
+       x = "Category", y = "Relative Frequency") +
+  theme_minimal() +
+  scale_fill_manual(values = strong_colors) +  # Apply custom strong colors
+  theme(legend.position = "none",  # Hide the legend
+        plot.title = element_text(size = 16, face = "bold"),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 14))
+
+```
